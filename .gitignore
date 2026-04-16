@@ -1,7 +1,9 @@
 node_modules/
 dist/
 .turbo/
-*.env
+.env
+.env.*
+!.env.example
 !*.env.example
 .DS_Store
 *.log
@@ -14,4 +16,13 @@ __pycache__/
 venv/
 .cache/
 *.tsbuildinfo
-apps/web/dist/
+*.sqlite
+*.sqlite3
+*.db
+apps/**/dist/
+apps/**/build/
+apps/**/.env
+apps/**/.env.*
+apps/**/__pycache__/
+apps/**/.venv/
+graphify-out/
