@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.turbo/
+*.env
+!*.env.example
+.DS_Store
+*.log
+coverage/
+.nyc_output/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.cache/
+*.tsbuildinfo
+apps/web/dist/
