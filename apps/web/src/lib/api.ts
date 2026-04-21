@@ -21,25 +21,92 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// Auto-refresh on 401; redirect to login when refresh itself fails
+// ── Token refresh helpers ─────────────────────────────────────────────────────
+
+function sleep(ms: number) {
+  return new Promise<void>(resolve => setTimeout(resolve, ms));
+}
+
+// Singleton in-flight refresh promise — prevents parallel 401s each calling /refresh
+let pendingRefresh: Promise<{ accessToken: string; refreshToken: string }> | null = null;
+
+async function doTokenRefresh(): Promise<{ accessToken: string; refreshToken: string }> {
+  const { refreshToken, setTokens } = useAuthStore.getState();
+
+  if (!refreshToken) {
+    useAuthStore.getState().logout();
+    redirectToLogin();
+    throw new Error('No refresh token');
+  }
+
+  const attempt = async () => {
+    const res = await axios.post('/api/v1/auth/refresh', { refreshToken });
+    setTokens(res.data.accessToken, res.data.refreshToken);
+    return res.data as { accessToken: string; refreshToken: string };
+  };
+
+  try {
+    return await attempt();
+  } catch (err) {
+    // If the refresh endpoint itself is rate-limited, wait and retry once
+    if (axios.isAxiosError(err) && err.response?.status === 429) {
+      const retryAfter = parseInt(err.response.headers['retry-after'] || '3', 10);
+      await sleep(Math.max(retryAfter, 2) * 1000);
+      try { return await attempt(); } catch { /* fall through to logout */ }
+    }
+    useAuthStore.getState().logout();
+    redirectToLogin();
+    throw err;
+  } finally {
+    pendingRefresh = null;
+  }
+}
+
+// ── Response interceptor ──────────────────────────────────────────────────────
+
 api.interceptors.response.use(
   (res) => res,
   async (error) => {
     const original = error.config;
-    if (error.response?.status === 401 && !original._retry) {
+    const status   = error.response?.status;
+    const url: string = original?.url ?? '';
+
+    // 429 Too Many Requests: honour Retry-After header, then replay once
+    if (status === 429 && !original._retry429) {
+      original._retry429 = true;
+      const retryAfter = parseInt(error.response?.headers?.['retry-after'] || '3', 10);
+      await sleep(Math.max(retryAfter, 2) * 1000);
+      return api(original);
+    }
+
+    // 401 Unauthorized: attempt one token refresh, then replay the original request.
+    // Skip if this request IS the refresh / login / signup (prevents infinite loop).
+    if (status === 401 && !original._retry) {
       original._retry = true;
+
+      const isPublicAuthCall =
+        url.includes('/auth/refresh') ||
+        url.includes('/auth/login')   ||
+        url.includes('/auth/signup');
+
+      if (isPublicAuthCall) {
+        useAuthStore.getState().logout();
+        redirectToLogin(url);
+        return Promise.reject(error);
+      }
+
       try {
-        const { refreshToken, setTokens, logout } = useAuthStore.getState();
-        if (!refreshToken) { logout(); redirectToLogin(original.url); return Promise.reject(error); }
-        const res = await axios.post('/api/v1/auth/refresh', { refreshToken });
-        setTokens(res.data.accessToken, res.data.refreshToken);
-        original.headers.Authorization = `Bearer ${res.data.accessToken}`;
+        // Reuse any in-flight refresh so N parallel 401s only call /refresh once
+        if (!pendingRefresh) pendingRefresh = doTokenRefresh();
+        const { accessToken } = await pendingRefresh;
+        original.headers.Authorization = `Bearer ${accessToken}`;
         return api(original);
       } catch {
-        useAuthStore.getState().logout();
-        redirectToLogin(original?.url);
+        // doTokenRefresh already called logout + redirect
+        return Promise.reject(error);
       }
     }
+
     return Promise.reject(error);
   },
 );
@@ -58,14 +125,25 @@ export const authApi = {
   login: (data: { email: string; password: string }) =>
     api.post('/auth/login', data).then(r => r.data),
   logout: () => api.post('/auth/logout').then(r => r.data),
-  me: () => api.get('/auth/me').then(r => r.data),
+  me:     () => api.get('/auth/me').then(r => r.data),
+  /** Generate a 30-day token for use in the Freelancer OS Chrome Extension. */
+  extensionToken: () =>
+    api.post<{ extensionToken: string; expiresIn: string }>('/auth/extension-token').then(r => r.data),
 };
 
 // ── Users ─────────────────────────────────────────────────────────────────────
 export const usersApi = {
   getProfile: () => api.get('/users/profile').then(r => r.data),
   updateProfile: (data: Record<string, unknown>) => api.put('/users/profile', data).then(r => r.data),
+  uploadAvatar: (file: File) => {
+    const formData = new FormData();
+    formData.append('avatar', file);
+    return api.post('/users/me/avatar', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    }).then(r => r.data);
+  },
   getStats: () => api.get('/users/stats').then(r => r.data),
+  deleteAccount: () => api.delete('/users/me').then(r => r.data),
 };
 
 // ── Proposals ─────────────────────────────────────────────────────────────────
@@ -121,15 +199,27 @@ export const analyticsApi = {
   getDashboard: () => api.get('/analytics/dashboard').then(r => r.data),
   getTimeline: (days?: number) => api.get('/analytics/timeline', { params: { days } }).then(r => r.data),
   getHeatmap: () => api.get('/analytics/heatmap').then(r => r.data),
+  getActivityCalendar: (month?: string) => api.get('/analytics/activity-calendar', { params: { month } }).then(r => r.data),
+  getLiveFeed: () => api.get('/analytics/live-feed').then(r => r.data),
 };
 
 // ── Scraper ───────────────────────────────────────────────────────────────────
 export const scraperApi = {
-  search:       (data: Record<string, unknown>) => api.post('/scraper/search', data).then(r => r.data),
-  status:       () => api.get('/scraper/status').then(r => r.data),
-  saveProject:  (data: Record<string, unknown>) => api.post('/scraper/save', data).then(r => r.data),
-  getSaved:     () => api.get('/scraper/saved').then(r => r.data),
-  deleteSaved:  (id: string) => api.delete(`/scraper/saved/${id}`).then(r => r.data),
+  search:               (data: Record<string, unknown>, noCache = false) =>
+    api.post(`/scraper/search${noCache ? '?noCache=1' : ''}`, data).then(r => r.data),
+  status:               () => api.get('/scraper/status').then(r => r.data),
+  saveProject:          (data: Record<string, unknown>) => api.post('/scraper/save', data).then(r => r.data),
+  getSaved:             () => api.get('/scraper/saved').then(r => r.data),
+  deleteSaved:          (id: string) => api.delete(`/scraper/saved/${id}`).then(r => r.data),
+  /** Poll for projects scraped by the Chrome extension (cached in Redis). */
+  getExtensionResults: (query: string, platform: string) =>
+    api.get('/scraper/extension-results', { params: { query, platform } }).then(r => r.data),
+  /** Bust cached extension + scraper results for a query (called on Refresh). */
+  deleteExtensionResults: (query: string, platform: string) =>
+    api.delete('/scraper/extension-results', { params: { query, platform } }).then(r => r.data),
+  /** Get extension auto-scrape run log + projects for Automation page. */
+  getAutoResults: () =>
+    api.get('/scraper/auto-results').then(r => r.data),
 };
 
 // ── Platform Connections (OAuth) ──────────────────────────────────────────────

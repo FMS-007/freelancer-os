@@ -1,11 +1,11 @@
 import { useState } from 'react';
 import { useAuthStore } from '../store/authStore';
-import { api, proposalsApi, recordsApi } from '../lib/api';
+import { api, authApi, proposalsApi, recordsApi } from '../lib/api';
 import { useNavigate } from 'react-router-dom';
 import { isFirebaseConfigured, registerPushNotifications } from '../lib/firebase';
 import {
   Shield, Bell, Database, Trash2, Download,
-  Key, Check, AlertTriangle, RefreshCw,
+  Key, Check, AlertTriangle, RefreshCw, Copy, Puzzle,
 } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -20,6 +20,11 @@ export default function Settings() {
 
   // Push notifications
   const [pushStatus, setPushStatus] = useState<'idle' | 'loading' | 'ok' | 'denied'>('idle');
+
+  // Extension token
+  const [extToken, setExtToken]       = useState('');
+  const [extTokenStatus, setExtTokenStatus] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
+  const [extTokenCopied, setExtTokenCopied] = useState(false);
 
   // Data export
   const [exporting, setExporting] = useState(false);
@@ -61,6 +66,24 @@ export default function Settings() {
     }
   }
 
+  async function handleGenerateExtToken() {
+    setExtTokenStatus('loading');
+    try {
+      const { extensionToken } = await authApi.extensionToken();
+      setExtToken(extensionToken);
+      setExtTokenStatus('ok');
+    } catch {
+      setExtTokenStatus('error');
+    }
+  }
+
+  async function handleCopyExtToken() {
+    if (!extToken) return;
+    await navigator.clipboard.writeText(extToken);
+    setExtTokenCopied(true);
+    setTimeout(() => setExtTokenCopied(false), 2000);
+  }
+
   async function handleExportAll() {
     setExporting(true);
     try {
@@ -88,7 +111,7 @@ export default function Settings() {
   }
 
   return (
-    <div className="p-6 max-w-3xl mx-auto">
+    <div className="page-shell-tight">
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-dark">Settings</h1>
         <p className="text-slate-500 mt-0.5">Account security, notifications, and data management</p>
@@ -184,6 +207,56 @@ export default function Settings() {
               </p>
             )}
           </div>
+        </div>
+
+        {/* Chrome Extension Token */}
+        <div className="card p-5">
+          <h2 className="font-semibold text-dark mb-1 flex items-center gap-2">
+            <Puzzle size={16} className="text-primary" /> Chrome Extension
+          </h2>
+          <p className="text-sm text-slate-500 mb-4">
+            Generate a long-lived token (30 days) for the{' '}
+            <span className="font-medium text-dark">Freelancer OS Connector</span> browser extension.
+            Paste it in the extension popup to connect it to your account.
+          </p>
+          <button
+            onClick={handleGenerateExtToken}
+            disabled={extTokenStatus === 'loading'}
+            className="btn-primary mb-3"
+          >
+            {extTokenStatus === 'loading'
+              ? <><RefreshCw size={14} className="animate-spin" /> Generating...</>
+              : <><Key size={14} /> Generate Token</>}
+          </button>
+          {extTokenStatus === 'ok' && extToken && (
+            <div className="space-y-2">
+              <label className="label text-xs">Extension Token (expires in 30 days)</label>
+              <div className="flex gap-2">
+                <input
+                  readOnly
+                  value={extToken}
+                  className="input font-mono text-xs flex-1 select-all"
+                  onClick={(e) => (e.target as HTMLInputElement).select()}
+                />
+                <button
+                  onClick={handleCopyExtToken}
+                  className={clsx(
+                    'btn flex-shrink-0 text-xs',
+                    extTokenCopied ? 'bg-success text-white' : 'btn-secondary',
+                  )}
+                  title="Copy token"
+                >
+                  {extTokenCopied ? <><Check size={13} /> Copied</> : <><Copy size={13} /> Copy</>}
+                </button>
+              </div>
+              <p className="text-xs text-slate-400">
+                Paste this token into the Freelancer OS Chrome Extension popup → API Connection → Auth Token
+              </p>
+            </div>
+          )}
+          {extTokenStatus === 'error' && (
+            <p className="text-xs text-danger">Failed to generate token. Please try again.</p>
+          )}
         </div>
 
         {/* Data Export */}

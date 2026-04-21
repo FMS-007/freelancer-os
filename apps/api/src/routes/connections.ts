@@ -491,11 +491,37 @@ router.post('/:platform/token', authenticate, async (req: AuthRequest, res: Resp
 });
 
 // POST /api/v1/connections/:platform/browser-connect
-// Opens a real Chromium browser on the scraper machine for manual login.
+// Accepts cookies either from the Chrome extension (req.body.cookies array) or by
+// opening a real Chromium browser on the scraper machine for manual login.
 router.post('/:platform/browser-connect', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     if (!req.userId) throw createError('Unauthorized', 401);
     const platform = parsePlatform(req.params.platform);
+
+    // ── Extension fast-path: cookies sent directly from the Chrome extension ──
+    if (Array.isArray(req.body.cookies) && req.body.cookies.length > 0) {
+      const cookiesStr = JSON.stringify(req.body.cookies);
+      await upsertConnection({
+        userId:                 req.userId,
+        platform,
+        accessToken:            `ext-session-${Date.now()}`,
+        refreshToken:           null,
+        sessionToken:           null,
+        cookies:                cookiesStr,
+        platformUserId:         null,
+        externalId:             null,
+        email:                  null,
+        username:               null,
+        scopes:                 [],
+        connectedAccountStatus: 'connected',
+        expiresAt:              null,
+        expiryTime:             null,
+      });
+      console.log(`[browser-connect] ✓ ${platform} connected via extension cookies — user=${req.userId} cookies=${req.body.cookies.length}`);
+      return res.json({ success: true, platform, username: null, email: null, source: 'extension' });
+    }
+
+    // ── Scraper-service path: open a Chromium window on the scraper machine ──
     const scraperUrl = (process.env.SCRAPER_URL || 'http://localhost:8001').replace(/\/+$/, '');
 
     console.log(`[browser-connect] starting ${platform} for user ${req.userId}`);
@@ -621,6 +647,38 @@ router.get('/:platform/token', authenticate, async (req: AuthRequest, res: Respo
     if (!token) throw createError('Could not decrypt stored token', 500);
 
     res.json({ token, platform });
+  } catch (err) { next(err); }
+});
+
+// GET /api/v1/connections/:platform/cookies-internal — internal use by scraper service only
+// Requires X-Internal-Key header matching INTERNAL_SERVICE_KEY env var.
+// Returns decrypted cookies array so the scraper can make authenticated requests.
+router.get('/:platform/cookies-internal', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const internalKey = process.env.INTERNAL_SERVICE_KEY;
+    const provided = req.headers['x-internal-key'];
+    if (!internalKey || provided !== internalKey) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const platform = parsePlatform(req.params.platform);
+    const { userId } = req.query as { userId?: string };
+    if (!userId) {
+      res.status(400).json({ error: 'userId is required' });
+      return;
+    }
+    const conn = await prisma.platformConnection.findUnique({
+      where: { userId_platform: { userId, platform } },
+      select: { cookies: true },
+    });
+    if (!conn?.cookies) {
+      res.json({ cookies: [] });
+      return;
+    }
+    const decrypted = decrypt(conn.cookies) ?? conn.cookies;
+    let cookies: unknown[] = [];
+    try { cookies = JSON.parse(decrypted); } catch { cookies = []; }
+    res.json({ cookies: Array.isArray(cookies) ? cookies : [] });
   } catch (err) { next(err); }
 });
 

@@ -129,4 +129,18 @@ router.get('/me', authenticate, async (req: AuthRequest, res: Response, next: Ne
   }
 });
 
+// POST /api/v1/auth/extension-token — generate a long-lived token for the Chrome extension
+router.post('/extension-token', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const secret = process.env.JWT_SECRET!;
+    // 30-day token — accepted by authenticate middleware like any JWT
+    const extensionToken = jwt.sign({ userId: req.userId }, secret, { expiresIn: '30d' });
+    // Store in Redis so user can revoke it later (key per-user; overwritten each generation)
+    await redis.set(`ext-token:${req.userId}`, extensionToken, 'EX', 60 * 60 * 24 * 30);
+    res.json({ extensionToken, expiresIn: '30d', message: 'Paste this token in the Freelancer OS Chrome Extension' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;

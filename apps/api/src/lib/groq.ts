@@ -17,6 +17,15 @@ function hashText(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
+function trimToWordLimit(text: string, wordLimit?: number): string {
+  if (!wordLimit || wordLimit <= 0) return text.trim();
+
+  const words = text.trim().split(/\s+/).filter(Boolean);
+  if (words.length <= wordLimit) return text.trim();
+
+  return `${words.slice(0, wordLimit).join(' ').trim()}...`;
+}
+
 // ── Project Analysis ──────────────────────────────────────────────────────────
 export interface AnalysisResult {
   recommendedStructure: string[];
@@ -36,6 +45,13 @@ export async function analyzeProject(
   userSkills: string[],
   hourlyRate: number,
   clientCountry = 'Unknown',
+  extraContext?: {
+    projectUrl?: string;
+    paymentVerified?: boolean;
+    emailVerified?: boolean;
+    phoneVerified?: boolean;
+    proposalsCount?: number;
+  },
 ): Promise<AnalysisResult> {
   const cacheKey = `ai:analysis:${hashText(projectTitle + projectDescription)}`;
   const cached = await getCache<AnalysisResult>(cacheKey);
@@ -48,6 +64,10 @@ export async function analyzeProject(
 Project Title: ${projectTitle}
 Project Description: ${projectDescription}
 Client Country: ${clientCountry}
+${extraContext?.paymentVerified != null ? `Client Payment Verified: ${extraContext.paymentVerified ? 'Yes' : 'No'}` : ''}
+${extraContext?.emailVerified != null ? `Client Email Verified: ${extraContext.emailVerified ? 'Yes' : 'No'}` : ''}
+${extraContext?.phoneVerified != null ? `Client Phone Verified: ${extraContext.phoneVerified ? 'Yes' : 'No'}` : ''}
+${extraContext?.proposalsCount != null ? `Total Proposals/Bids Submitted: ${extraContext.proposalsCount} (higher competition)` : ''}
 Freelancer Skills: ${userSkills.join(', ')}
 Freelancer Hourly Rate: $${hourlyRate}/hr
 
@@ -105,24 +125,76 @@ export async function generateProposal(
   analysis: AnalysisResult,
   userName: string,
   userBio: string,
-  strategy: string,
+  strategy?: string,
+  instruction?: {
+    id?: string;
+    title: string;
+    content: string;
+    wordLimit?: number;
+    endingText?: string;
+    appendEnding?: boolean;
+  },
+  generationMode: 'auto' | 'instruction' | 'ai' = 'auto',
+  projectContext?: {
+    budget?: string;
+    clientCountry?: string;
+    projectUrl?: string;
+    proposalsCount?: number;
+    paymentVerified?: boolean;
+    emailVerified?: boolean;
+    phoneVerified?: boolean;
+  },
 ): Promise<string> {
-  const systemPrompt = `You are an expert freelance proposal writer. Write compelling, personalized proposals that win jobs. Be concise, confident, and client-focused.`;
+  const systemPrompt = `You are an expert freelance proposal writer.
+Write compelling, personalized proposals that win jobs.
+The output must be clean, readable, well-structured, and client-focused.
+Always use strong paragraph structure.
+Default structure unless instruction overrides it: intro -> solution -> value -> CTA -> ending.`;
+
+  const modeGuidance = generationMode === 'instruction'
+    ? 'STRICTLY follow the provided instruction for tone, structure, word limit, and ending.'
+    : generationMode === 'ai'
+      ? 'Ignore saved instructions and generate the strongest professional proposal using your own judgment.'
+      : instruction
+        ? 'Use the provided auto-selected instruction as the primary rule set and follow it closely.'
+        : 'No saved instruction is available. Use smart default AI proposal logic.';
+
+  const structureGuidance = instruction
+    ? 'Respect the instruction tone and structure. If the instruction is incomplete, still ensure a strong opening, solution section, value section, CTA, and ending.'
+    : 'Use a polished format with a strong opening, clear solution, concise value proof, and direct CTA.';
 
   const userPrompt = `Write a freelance proposal for this project:
 
 Project: ${projectTitle}
 Description: ${projectDescription}
-Strategy: ${strategy}
+${strategy ? `Strategy: ${strategy}` : `Auto-select the best proposal style based on the project context, budget type (${analysis.biddingStrategy}), and winning angle.`}
+Generation Mode: ${generationMode}
+Mode Guidance: ${modeGuidance}
+${instruction ? `Instruction Title: ${instruction.title}` : ''}
+${instruction ? `Instruction Content: ${instruction.content}` : ''}
+${instruction?.wordLimit ? `Target Word Limit: ${instruction.wordLimit} words` : ''}
+${instruction?.appendEnding ? `Ending Text To Append: ${instruction.endingText || 'Best regards, {Your Name}'}` : ''}
 Winning Angle: ${analysis.winningAngle}
 Recommended Structure: ${analysis.recommendedStructure.join(' → ')}
 Bidding Strategy: ${analysis.biddingStrategy}
+${projectContext?.budget ? `Project Budget: ${projectContext.budget}` : ''}
+${projectContext?.clientCountry ? `Client Country: ${projectContext.clientCountry}` : ''}
+${projectContext?.projectUrl ? `Project URL: ${projectContext.projectUrl}` : ''}
+${projectContext?.proposalsCount != null ? `Current Bid Count: ${projectContext.proposalsCount}` : ''}
+${projectContext?.paymentVerified != null ? `Payment Verified: ${projectContext.paymentVerified ? 'Yes' : 'No'}` : ''}
+${projectContext?.emailVerified != null ? `Email Verified: ${projectContext.emailVerified ? 'Yes' : 'No'}` : ''}
+${projectContext?.phoneVerified != null ? `Phone Verified: ${projectContext.phoneVerified ? 'Yes' : 'No'}` : ''}
 
 Freelancer Info:
 Name: ${userName}
 Bio: ${userBio}
 
-Write a complete, professional proposal following the recommended structure. Be specific to the project. Keep it under 350 words.`;
+Write a complete, professional proposal following the recommended structure.
+Be specific to the project.
+${structureGuidance}
+${instruction?.wordLimit ? `Keep it around ${instruction.wordLimit} words (do not exceed by more than 10%).` : 'Keep it under 350 words.'}
+${instruction?.appendEnding ? 'Ensure the final line uses the requested ending text exactly.' : 'End with a polished professional sign-off.'}
+Return only the final proposal text.`;
 
   const completion = await groq.chat.completions.create({
     model: GROQ_MODELS.smart,
@@ -134,7 +206,20 @@ Write a complete, professional proposal following the recommended structure. Be 
     max_tokens: 1024,
   });
 
-  return completion.choices[0]?.message?.content || '';
+  let proposal = completion.choices[0]?.message?.content || '';
+
+  proposal = proposal.replace(/\n{3,}/g, '\n\n').trim();
+
+  if (instruction?.appendEnding && instruction.endingText?.trim()) {
+    const endingText = instruction.endingText.trim();
+    if (!proposal.includes(endingText)) {
+      proposal = `${proposal.trim()}\n\n${endingText}`;
+    }
+  }
+
+  proposal = trimToWordLimit(proposal, instruction?.wordLimit);
+
+  return proposal;
 }
 
 // ── Profile Review ────────────────────────────────────────────────────────────

@@ -3,13 +3,17 @@ import axios from 'axios';
 import { AuthRequest, authenticate } from '../middleware/auth';
 import { ScraperQuerySchema } from '@freelancer-os/shared';
 import { validate } from '../middleware/validate';
-import { getCache, setCache } from '../lib/redis';
+import { getCache, setCache, delCache } from '../lib/redis';
 import prisma from '../lib/prisma';
 import rateLimit from 'express-rate-limit';
 
 const router: Router = Router();
 
 const SCRAPER_URL = process.env.SCRAPER_URL || 'http://localhost:8001';
+
+function normalizeQuery(query: string): string {
+  return String(query || '').trim().toLowerCase();
+}
 
 // GET /api/v1/scraper/status
 router.get('/status', async (_req, res) => {
@@ -32,28 +36,78 @@ const scraperLimiter = rateLimit({
 router.post(
   '/search',
   scraperLimiter,
+  authenticate,
   validate(ScraperQuerySchema),
   async (req: AuthRequest, res: Response, next: NextFunction) => {
     try {
       const { query, platform, limit } = req.body;
-      const cacheKey = `scraper:${platform}:${query}:${limit}`;
+      const userId      = req.userId ?? 'anon';
+      const normalizedQ = normalizeQuery(query as string);
+      const plat        = String(platform || 'both').toLowerCase();
+      const noCache     = req.query.noCache === '1';
 
-      const cached = await getCache(cacheKey);
-      if (cached) {
-        // Cached responses don't have platformOutcomes — return minimal metadata
-        res.json({ projects: cached, cached: true, platformOutcomes: {} });
-        return;
+      const cacheKey = `scraper:${userId}:${plat}:${normalizedQ}:${limit}`;
+
+      if (!noCache) {
+        // ── 1. Check extension results first (highest priority) ──────────────
+        const extKeys = plat === 'both'
+          ? [
+              `ext-results:${userId}:both:${normalizedQ}`,
+              `ext-results:${userId}:upwork:${normalizedQ}`,
+              `ext-results:${userId}:freelancer:${normalizedQ}`,
+            ]
+          : [
+              `ext-results:${userId}:${plat}:${normalizedQ}`,
+              `ext-results:${userId}:both:${normalizedQ}`,
+            ];
+
+        const seenExtIds = new Set<string>();
+        const extProjects: unknown[] = [];
+
+        for (const key of extKeys) {
+          const cached = await getCache<unknown[]>(key);
+          if (cached && Array.isArray(cached)) {
+            for (const p of cached) {
+              const pid = (p as Record<string, unknown>).id as string | undefined;
+              if (pid && seenExtIds.has(pid)) continue;
+              if (pid) seenExtIds.add(pid);
+              extProjects.push(p);
+            }
+          }
+        }
+
+        if (extProjects.length > 0) {
+          console.log(`[search] Found ${extProjects.length} extension results in Redis for query '${normalizedQ}'`);
+          res.json({
+            projects:         extProjects,
+            platformOutcomes: {},
+            cached:           true,
+            source:           'extension',
+            total:            extProjects.length,
+          });
+          return;
+        }
+
+        // ── 2. Check regular cache ───────────────────────────────────────────
+        const cachedResult = await getCache(cacheKey);
+        if (cachedResult) {
+          res.json({ projects: cachedResult, cached: true, platformOutcomes: {}, source: 'cache' });
+          return;
+        }
+      } else {
+        // noCache: delete existing scraper cache so fresh result replaces it
+        await delCache(cacheKey).catch(() => {});
       }
 
+      // ── 3. Call Python scraper ─────────────────────────────────────────────
       let response;
       try {
         response = await axios.post(
           `${SCRAPER_URL}/scrape`,
-          { query, platform, limit },
+          { query, platform, limit, user_id: req.userId ?? null },
           { timeout: 60000 },
         );
       } catch (scraperErr: unknown) {
-        // Connection refused / ECONNREFUSED / timeout → scraper process is down
         const isConnectionError =
           axios.isAxiosError(scraperErr) &&
           (scraperErr.code === 'ECONNREFUSED' ||
@@ -70,7 +124,6 @@ router.post(
             platformOutcomes: {},
           });
         } else {
-          // Scraper is up but returned an HTTP error (4xx/5xx from Python side)
           const data = axios.isAxiosError(scraperErr) ? scraperErr.response?.data : {};
           res.status(200).json({
             projects: [],
@@ -85,17 +138,17 @@ router.post(
       const projects         = response.data.projects ?? [];
       const platformOutcomes = response.data.platformOutcomes ?? {};
 
-      // Only cache when at least one platform succeeded
       const anySuccess = Object.values(platformOutcomes as Record<string, { status: string }>)
         .some(o => o.status === 'success');
       if (anySuccess || projects.length > 0) {
-        await setCache(cacheKey, projects, 300);
+        await setCache(cacheKey, projects, 120);
       }
 
       res.json({
         projects,
         platformOutcomes,
         cached: false,
+        source: 'scraper',
         total: response.data.total ?? projects.length,
       });
     } catch (err) {
@@ -104,7 +157,7 @@ router.post(
   },
 );
 
-// POST /api/v1/scraper/save  — saves a matched project to ProjectRecord (deduplicates by URL)
+// POST /api/v1/scraper/save
 router.post('/save', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { title, description, budget, skills, clientCountry, url, platform } = req.body;
@@ -114,7 +167,6 @@ router.post('/save', authenticate, async (req: AuthRequest, res: Response, next:
       return;
     }
 
-    // Deduplicate by URL for this user
     if (url) {
       const existing = await prisma.projectRecord.findFirst({
         where: { userId: req.userId!, url },
@@ -144,7 +196,7 @@ router.post('/save', authenticate, async (req: AuthRequest, res: Response, next:
   }
 });
 
-// GET /api/v1/scraper/saved — list user's saved projects
+// GET /api/v1/scraper/saved
 router.get('/saved', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const records = await prisma.projectRecord.findMany({
@@ -158,12 +210,261 @@ router.get('/saved', authenticate, async (req: AuthRequest, res: Response, next:
   }
 });
 
-// DELETE /api/v1/scraper/saved/:id — remove a saved project
+// DELETE /api/v1/scraper/saved/:id
 router.delete('/saved/:id', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     await prisma.projectRecord.deleteMany({ where: { id, userId: req.userId! } });
     res.json({ deleted: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Extension results ─────────────────────────────────────────────────────────
+
+// POST /api/v1/scraper/extension-results
+router.post('/extension-results', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { platform, query, projects } = req.body as {
+      platform?: string;
+      query?: string;
+      projects?: unknown[];
+    };
+
+    if (!query || typeof query !== 'string') {
+      res.status(400).json({ error: 'query is required' });
+      return;
+    }
+    if (!Array.isArray(projects)) {
+      res.status(400).json({ error: 'projects must be an array' });
+      return;
+    }
+
+    const userId      = req.userId!;
+    const normalizedQ = normalizeQuery(query);
+    const plat        = String(platform || 'both').toLowerCase();
+    const cacheKey    = `ext-results:${userId}:${plat}:${normalizedQ}`;
+
+    // Apply 24h freshness filter before caching so stale results never reach the UI.
+    const freshProjects = (projects as Array<Record<string, unknown>>)
+      .filter(p => is24hFresh(p.postedAt));
+
+    await setCache(cacheKey, freshProjects, 600);
+    console.log(`[extension-results] Stored ${freshProjects.length}/${projects.length} fresh projects for user ${userId}, query='${normalizedQ}', platform='${plat}'`);
+
+    res.json({ success: true, received: projects.length, fresh: freshProjects.length, platform: plat, query: normalizedQ });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/v1/scraper/extension-results
+router.get('/extension-results', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { query, platform } = req.query as { query?: string; platform?: string };
+
+    if (!query) {
+      res.json({ projects: [], cached: false });
+      return;
+    }
+
+    const userId      = req.userId!;
+    const normalizedQ = normalizeQuery(query as string);
+    const plat        = String(platform || 'both').toLowerCase();
+
+    const keys = plat === 'both'
+      ? [
+          `ext-results:${userId}:both:${normalizedQ}`,
+          `ext-results:${userId}:upwork:${normalizedQ}`,
+          `ext-results:${userId}:freelancer:${normalizedQ}`,
+        ]
+      : [
+          `ext-results:${userId}:${plat}:${normalizedQ}`,
+          `ext-results:${userId}:both:${normalizedQ}`,
+        ];
+
+    const seenIds = new Set<string>();
+    const merged: unknown[] = [];
+
+    for (const key of keys) {
+      const cached = await getCache<unknown[]>(key);
+      if (cached && Array.isArray(cached)) {
+        for (const p of cached) {
+          const pid = (p as Record<string, unknown>).id as string | undefined;
+          if (pid && seenIds.has(pid)) continue;
+          if (pid) seenIds.add(pid);
+          merged.push(p);
+        }
+      }
+    }
+
+    res.json({ projects: merged, cached: merged.length > 0, source: 'extension' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/v1/scraper/extension-results — bust cache for a query (used by Refresh)
+router.delete('/extension-results', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { query, platform } = req.query as { query?: string; platform?: string };
+
+    if (!query) {
+      res.status(400).json({ error: 'query is required' });
+      return;
+    }
+
+    const userId      = req.userId!;
+    const normalizedQ = normalizeQuery(query as string);
+    const plat        = String(platform || 'both').toLowerCase();
+
+    const keysToDelete = plat === 'both'
+      ? [
+          `ext-results:${userId}:both:${normalizedQ}`,
+          `ext-results:${userId}:upwork:${normalizedQ}`,
+          `ext-results:${userId}:freelancer:${normalizedQ}`,
+          `scraper:${userId}:both:${normalizedQ}:50`,
+          `scraper:${userId}:both:${normalizedQ}:100`,
+        ]
+      : [
+          `ext-results:${userId}:${plat}:${normalizedQ}`,
+          `ext-results:${userId}:both:${normalizedQ}`,
+          `scraper:${userId}:${plat}:${normalizedQ}:50`,
+          `scraper:${userId}:${plat}:${normalizedQ}:100`,
+        ];
+
+    await Promise.allSettled(keysToDelete.map(k => delCache(k)));
+
+    res.json({ success: true, cleared: keysToDelete.length });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Returns true when a postedAt string represents a project from the last 24 hours.
+// Accepts both RFC 2822 (Upwork RSS) and "Jan 15, 2025" (Freelancer) formats.
+// Unknown / unparseable dates are treated as fresh so they are not silently dropped.
+function is24hFresh(postedAt: unknown): boolean {
+  if (!postedAt || typeof postedAt !== 'string') return true;
+  const ms = new Date(postedAt as string).getTime();
+  if (isNaN(ms)) return true;
+  return Date.now() - ms <= 24 * 60 * 60 * 1000;
+}
+
+// POST /api/v1/scraper/auto-results — extension auto-scrape pushes results here
+// Frontend Automation page polls GET /scraper/auto-results to show activity
+router.post('/auto-results', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const { platform, query, projects, source } = req.body as {
+      platform?: string;
+      query?: string;
+      projects?: unknown[];
+      source?: string;
+    };
+
+    if (!Array.isArray(projects)) {
+      res.status(400).json({ error: 'projects must be an array' });
+      return;
+    }
+
+    const userId = req.userId!;
+    const ts     = new Date().toISOString();
+    const plat   = String(platform || 'both');
+    const q      = String(query || '');
+
+    // Server-side 24-hour freshness guard — rejects stale projects the extension
+    // may have forwarded before client-side filtering was in place.
+    const receivedCount = projects.length;
+    const freshProjects = (projects as Array<Record<string, unknown>>)
+      .filter(p => is24hFresh(p.postedAt));
+    const staleDropped = receivedCount - freshProjects.length;
+
+    console.log(`[auto-results] Received ${receivedCount} from extension for user ${userId}, query "${q}" on ${plat}${staleDropped > 0 ? ` (dropped ${staleDropped} stale)` : ''}`);
+
+    // Store as a run log entry in Redis (list, capped at 50 entries)
+    const logKey  = `auto-log:${userId}`;
+    const entry   = JSON.stringify({
+      ts, platform: plat, query: q,
+      received: receivedCount, fresh: freshProjects.length,
+      source: source || 'extension',
+    });
+    await import('../lib/redis').then(({ redis }) => {
+      return redis.lpush(logKey, entry).then(() => redis.ltrim(logKey, 0, 49)).then(() => redis.expire(logKey, 60 * 60 * 24 * 7));
+    });
+
+    // Store projects in Redis so Automation page can display them.
+    // Only keep projects from the current run (this run's fresh projects), capped at 500.
+    // We do NOT merge with the old cache here — each run replaces with a new deduplicated set
+    // to prevent the saved count from accumulating beyond what was actually scraped.
+    const projKey  = `auto-projects:${userId}`;
+    const existing = await getCache<unknown[]>(projKey) ?? [];
+    const existingIds = new Set((existing as Array<Record<string, unknown>>).map(p => p.id as string));
+    const newOnes  = freshProjects.filter(p => !existingIds.has(p.id as string));
+    // Merge: new unique projects at front, keep existing up to 500 total
+    const merged   = [...newOnes, ...existing].slice(0, 500);
+    await setCache(projKey, merged, 60 * 60 * 24); // 24-hour TTL
+
+    // Also persist new projects to DB (ProjectRecord) — deduplicate by URL
+    let dbSaved = 0;
+    for (const p of newOnes) {
+      try {
+        const url = p.url ? String(p.url) : null;
+        if (url) {
+          const dup = await prisma.projectRecord.findFirst({ where: { userId, url } });
+          if (dup) continue;
+        }
+        await prisma.projectRecord.create({
+          data: {
+            userId,
+            title:         String(p.title || '').trim() || 'Untitled',
+            description:   String(p.description || '').substring(0, 2000),
+            clientCountry: String(p.clientCountry || 'Unknown'),
+            techStack:     Array.isArray(p.skills) ? (p.skills as string[]) : [],
+            platform:      String(p.platform || 'upwork'),
+            url,
+            bidAmount:     0,
+          },
+        });
+        dbSaved++;
+      } catch { /* skip individual save errors */ }
+    }
+
+    if (dbSaved > 0) {
+      console.log(`[auto-results] Saved ${dbSaved} new project(s) to DB for user ${userId}`);
+    }
+
+    res.json({
+      success: true,
+      received: receivedCount,
+      fresh: freshProjects.length,
+      stored: newOnes.length,
+      dbSaved,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/v1/scraper/auto-results — Automation page polls for extension auto-scrape results
+router.get('/auto-results', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const userId   = req.userId!;
+    const logKey   = `auto-log:${userId}`;
+    const projKey  = `auto-projects:${userId}`;
+
+    const [logEntries, projects] = await Promise.all([
+      import('../lib/redis').then(({ redis }) => redis.lrange(logKey, 0, 49)),
+      getCache<unknown[]>(projKey),
+    ]);
+
+    const logs = (logEntries ?? []).map(e => { try { return JSON.parse(e); } catch { return null; } }).filter(Boolean);
+
+    res.json({
+      projects: projects ?? [],
+      logs,
+      total: (projects ?? []).length,
+    });
   } catch (err) {
     next(err);
   }

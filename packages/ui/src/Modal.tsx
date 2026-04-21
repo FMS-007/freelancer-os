@@ -38,14 +38,14 @@ export function Modal({ open, onClose, title, children, size = 'md', footer }: M
     >
       {/* Backdrop */}
       <div
-        className="absolute inset-0 bg-black/40 backdrop-blur-sm"
+        className="absolute inset-0 bg-slate-900/28 backdrop-blur-[2px]"
         onClick={onClose}
       />
 
       {/* Panel */}
       <div
         className={clsx(
-          'relative w-full bg-white rounded-2xl shadow-xl flex flex-col max-h-[90vh]',
+          'relative w-full rounded-2xl flex flex-col max-h-[90vh] border border-white/60 bg-white/86 backdrop-blur-md shadow-[0_18px_48px_rgba(15,23,42,0.14),inset_0_1px_0_rgba(255,255,255,0.7)]',
           sizeClasses[size],
         )}
       >

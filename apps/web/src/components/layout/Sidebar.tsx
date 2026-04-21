@@ -1,11 +1,11 @@
 import type { ElementType, ReactNode } from 'react';
 import { Link, NavLink, useNavigate } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
 import {
   LayoutDashboard,
   Search,
   Bot,
   Brain,
-  FileText,
   BookTemplate,
   ClipboardList,
   BarChart2,
@@ -16,7 +16,8 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useAuthStore } from '../../store/authStore';
-import { authApi } from '../../lib/api';
+import { authApi, connectionsApi, usersApi } from '../../lib/api';
+import { calculateProfileCompletion } from '../../lib/profileCompletion';
 
 const MAIN_NAV = [
   { to: '/', icon: LayoutDashboard, label: 'Dashboard', end: true },
@@ -26,25 +27,11 @@ const MAIN_NAV = [
 ];
 
 const WORKSPACE_NAV = [
-  { to: '/proposals', icon: FileText, label: 'Proposals', end: false },
-  { to: '/templates', icon: BookTemplate, label: 'Templates', end: false },
+  { to: '/instructions', icon: BookTemplate, label: 'Instructions', end: false },
   { to: '/records', icon: ClipboardList, label: 'Records', end: false },
   { to: '/analytics', icon: BarChart2, label: 'Analytics', end: false },
   { to: '/alerts', icon: Bell, label: 'Alerts', end: false },
 ];
-
-function calcCompletion(user: { name?: string | null; email?: string | null; avatarUrl?: string | null; timezone?: string | null } | null): number {
-  if (!user) return 0;
-
-  const checks = [
-    !!user.name,
-    !!user.email,
-    !!user.avatarUrl,
-    !!user.timezone && user.timezone !== 'UTC',
-  ];
-
-  return Math.round((checks.filter(Boolean).length / checks.length) * 100);
-}
 
 function SectionLabel({ children }: { children: ReactNode }) {
   return (
@@ -100,7 +87,17 @@ export default function Sidebar() {
   const { user, logout } = useAuthStore();
   const navigate = useNavigate();
 
-  const completion = calcCompletion(user);
+  const { data: profileData } = useQuery({ queryKey: ['user-profile'], queryFn: usersApi.getProfile });
+  const { data: connectionStatus } = useQuery({
+    queryKey: ['platform-connections-status'],
+    queryFn: connectionsApi.status,
+  });
+
+  const completion = calculateProfileCompletion(
+    user,
+    profileData?.profile,
+    Number(Boolean(connectionStatus?.upwork)) + Number(Boolean(connectionStatus?.freelancer)),
+  );
   const initial = user?.name?.charAt(0).toUpperCase() ?? '?';
   const displayName = user?.name ?? 'My Profile';
 

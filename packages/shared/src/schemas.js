@@ -54,8 +54,13 @@ exports.ProposalStatusSchema = zod_1.z.object({
 exports.AnalyzeProjectSchema = zod_1.z.object({
     projectTitle: zod_1.z.string().min(1),
     projectDescription: zod_1.z.string().min(20),
+    projectUrl: zod_1.z.string().optional(),
     clientCountry: zod_1.z.string().optional(),
     clientTimezone: zod_1.z.string().optional(),
+    paymentVerified: zod_1.z.boolean().optional(),
+    emailVerified: zod_1.z.boolean().optional(),
+    phoneVerified: zod_1.z.boolean().optional(),
+    proposalsCount: zod_1.z.number().int().nonnegative().optional(),
 });
 // ── Alert Config ──────────────────────────────────────────────────────────────
 exports.AlertConfigSchema = zod_1.z.object({
@@ -70,5 +75,5 @@ exports.AlertConfigSchema = zod_1.z.object({
 exports.ScraperQuerySchema = zod_1.z.object({
     query: zod_1.z.string().min(1),
     platform: zod_1.z.enum(['upwork', 'freelancer', 'both']).default('both'),
-    limit: zod_1.z.number().min(1).max(50).default(20),
+    limit: zod_1.z.number().min(1).max(1000).default(50),
 });

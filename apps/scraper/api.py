@@ -85,6 +85,7 @@ class ScrapeRequest(BaseModel):
     query: str
     platform: str = "both"   # "upwork" | "freelancer" | "both"
     limit: int = 20
+    user_id: Optional[str] = None  # forwarded from API backend for authenticated cookie lookup
 
 class ScrapedProject(BaseModel):
     id: str
@@ -105,6 +106,45 @@ class PlatformResult(NamedTuple):
     projects: list[ScrapedProject]
     status: str   # "success" | "empty" | "platform_blocked" | "error"
     message: str = ""
+    error_code: str = ""  # "UPWORK_NOT_CONNECTED" | "UPWORK_COOKIES_EXPIRED" | "UPWORK_CLOUDFLARE_BLOCK" | "UPWORK_RATE_LIMIT"
+
+# ── Internal cookie fetcher ───────────────────────────────────────────────────
+
+async def _fetch_user_cookies(user_id: str, platform: str) -> dict:
+    """
+    Fetch decrypted platform cookies stored in the API DB for a given user.
+    Calls the internal cookies endpoint (requires INTERNAL_SERVICE_KEY env var).
+    Returns {cookieName: cookieValue} dict, or {} if unavailable.
+    """
+    api_base     = os.environ.get("API_BASE_URL", "http://localhost:3001")
+    service_key  = os.environ.get("INTERNAL_SERVICE_KEY", "")
+    if not service_key or not user_id:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                f"{api_base}/api/v1/connections/{platform}/cookies-internal",
+                params={"userId": user_id},
+                headers={"X-Internal-Key": service_key},
+            )
+            if resp.status_code == 200:
+                raw = resp.json().get("cookies", [])
+                cookie_dict: dict = {}
+                for c in raw:
+                    if isinstance(c, dict):
+                        name  = c.get("name", "")
+                        value = c.get("value", "")
+                        if name and value:
+                            cookie_dict[name] = value
+                logger.info(
+                    f"[cookies] Loaded {len(cookie_dict)} {platform} cookies "
+                    f"from DB for user {user_id}"
+                )
+                return cookie_dict
+    except Exception as e:
+        logger.warning(f"[cookies] Could not fetch {platform} cookies for user {user_id}: {e}")
+    return {}
+
 
 # ── Browser-like headers ──────────────────────────────────────────────────────
 
@@ -246,105 +286,210 @@ async def _get_nodriver_browser():
 
 CURRENCY_SYMBOLS = {1: "USD", 3: "GBP", 7: "EUR", 8: "AUD", 9: "CAD"}
 
+# ── Platform block status codes ───────────────────────────────────────────────
+_PLATFORM_BLOCK_CODES = {403, 404, 410, 429, 451}
+
+# ── Keyword expansion for broader related-tech matching ───────────────────────
+
+KEYWORD_EXPANSIONS: dict[str, list[str]] = {
+    "react":      ["react", "reactjs", "next.js", "react native", "mern stack"],
+    "node":       ["node.js", "nodejs", "nestjs", "express.js"],
+    "python":     ["python", "django", "fastapi", "flask"],
+    "wordpress":  ["wordpress", "woocommerce", "elementor", "wp theme plugin"],
+    "shopify":    ["shopify", "shopify liquid", "shopify app"],
+    "ai":         ["artificial intelligence", "machine learning", "chatgpt openai", "langchain llm"],
+    "flutter":    ["flutter", "dart", "flutter mobile app"],
+    "vue":        ["vue.js", "vuejs", "nuxt.js"],
+    "angular":    ["angular", "angular typescript"],
+    "php":        ["php", "laravel", "codeigniter", "php developer"],
+    "java":       ["java", "spring boot", "java developer"],
+    "blockchain": ["solidity", "smart contract", "web3", "ethereum nft"],
+    "docker":     ["docker", "kubernetes", "devops", "cicd pipeline"],
+    "ios":        ["ios swift", "iphone app", "ios developer"],
+    "android":    ["android kotlin", "android app", "android developer"],
+    "mern":       ["mern", "react node mongodb", "full stack javascript"],
+    "fullstack":  ["full stack", "fullstack developer", "mern mean"],
+    "typescript": ["typescript", "ts react", "ts node"],
+    "golang":     ["golang", "go developer", "go backend"],
+    "rust":       ["rust developer", "rust programming"],
+    "aws":        ["aws", "amazon web services", "aws developer"],
+    "graphql":    ["graphql", "apollo graphql"],
+    "scraping":   ["web scraping", "data extraction", "python scraper"],
+    "devops":     ["devops", "docker kubernetes", "cicd"],
+    "data":       ["data analysis", "data science", "pandas numpy"],
+}
+
+
+def _expand_keywords(query: str) -> list[str]:
+    """Return a list of search terms for a query (original + up to 2 related terms)."""
+    q = query.lower().strip()
+    for key, expansions in KEYWORD_EXPANSIONS.items():
+        if q == key or q.startswith(key + " ") or q.endswith(" " + key):
+            return expansions[:3]  # cap at 3 search terms total
+    return [query]
+
+
+def _parse_freelancer_project(p: dict) -> Optional[ScrapedProject]:
+    """Parse a single raw Freelancer project dict. Returns None on parse error."""
+    try:
+        budget = p.get("budget", {})
+        currency_id = budget.get("currency_id", 1)
+        currency = CURRENCY_SYMBOLS.get(currency_id, "USD")
+        b_min = budget.get("minimum", 0)
+        b_max = budget.get("maximum", 0)
+        budget_str = (
+            f"${int(b_min)}–${int(b_max)} {currency}"
+            if b_max else f"${int(b_min)}+ {currency}"
+        )
+        skills = [j.get("name", "") for j in p.get("jobs", []) if j.get("name")]
+        country = ""
+        owner = p.get("owner", {})
+        if isinstance(owner, dict):
+            country = owner.get("country", "") or ""
+        bid_stats = p.get("bid_stats", {})
+        bid_count = bid_stats.get("bid_count") if isinstance(bid_stats, dict) else None
+        submitted = p.get("time_submitted", 0)
+        posted_str = (
+            datetime.utcfromtimestamp(submitted).strftime("%b %d, %Y")
+            if submitted else "Unknown"
+        )
+        project_id = str(p.get("id", uuid.uuid4()))
+        seo_url    = p.get("seo_url", "")
+        project_url = (
+            f"https://www.freelancer.com/projects/{seo_url}"
+            if seo_url else f"https://www.freelancer.com/projects/{project_id}"
+        )
+        desc = (p.get("description", "") or "").strip()
+        desc = desc[:500] + ("..." if len(desc) > 500 else "")
+        return ScrapedProject(
+            id=f"fl_{project_id}",
+            title=p.get("title", "Untitled"),
+            description=desc,
+            budget=budget_str,
+            skills=skills[:8],
+            clientCountry=country,
+            clientRating=None,
+            postedAt=posted_str,
+            url=project_url,
+            platform="freelancer",
+            proposalsCount=bid_count,
+        )
+    except Exception as e:
+        logger.warning(f"[freelancer] Error parsing project: {e}")
+        return None
+
+
 async def scrape_freelancer(query: str, limit: int) -> PlatformResult:
     """
-    Fetch active projects from Freelancer.com public API.
-    Uses sort_field=time_updated + reverse_sort=true to get fresh/newest projects.
-    Cache-buster timestamp prevents any proxy/CDN from serving stale data.
+    Fetch active projects from Freelancer.com public API with full pagination.
+    - Expands keywords for broader coverage (react → next.js, react native, etc.)
+    - Paginates up to 1000 total projects, 100 per page, 3 pages in parallel batches
+    - Deduplicates results across expanded queries
     """
-    url = "https://www.freelancer.com/api/projects/0.1/projects/active/"
-    params = {
-        "query":             query,
-        "limit":             min(limit, 50),
-        "sort_field":        "time_updated",    # newest first
-        "reverse_sort":      "true",
-        "full_description":  "true",
-        "job_details":       "true",
-        "country_details":   "true",
-        "user_details":      "true",
-        "compact":           "false",
+    MAX_PROJECTS = min(max(limit, 300), 1000)
+    PAGE_SIZE    = 100
+    BATCH_SIZE   = 3    # pages fetched in parallel per round
+
+    API_URL = "https://www.freelancer.com/api/projects/0.1/projects/active/"
+    BASE_PARAMS: dict = {
+        "full_description":   "true",
+        "job_details":        "true",
+        "country_details":    "true",
+        "user_details":       "true",
+        "compact":            "false",
         "project_statuses[]": "active",
-        "_t":                str(int(time.time())),  # cache-buster
+        "sort_field":         "time_updated",
+        "reverse_sort":       "true",
     }
-    logger.info(f"[freelancer] GET {url} query={query!r} limit={min(limit,50)}")
+
+    seen_ids: set[str]              = set()
+    all_projects: list[ScrapedProject] = []
+    expanded_queries                = _expand_keywords(query)
+    pages_fetched                   = 0
+    start_time                      = time.time()
+    blocked_code: Optional[int]     = None
 
     try:
-        async with httpx.AsyncClient(timeout=20, headers=HEADERS) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
+        async with httpx.AsyncClient(timeout=25, headers=HEADERS) as client:
+            for search_query in expanded_queries:
+                if len(all_projects) >= MAX_PROJECTS:
+                    break
 
-        projects_raw = data.get("result", {}).get("projects", [])
-        logger.info(f"[freelancer] API returned {len(projects_raw)} projects")
+                offset = 0
+                while len(all_projects) < MAX_PROJECTS:
+                    # Build a parallel batch of page requests
+                    batch_offsets = [
+                        offset + i * PAGE_SIZE
+                        for i in range(BATCH_SIZE)
+                        if offset + i * PAGE_SIZE < MAX_PROJECTS
+                    ]
+                    if not batch_offsets:
+                        break
 
-        result: list[ScrapedProject] = []
-        for p in projects_raw:
-            try:
-                budget = p.get("budget", {})
-                currency_id = budget.get("currency_id", 1)
-                currency = CURRENCY_SYMBOLS.get(currency_id, "USD")
-                b_min = budget.get("minimum", 0)
-                b_max = budget.get("maximum", 0)
-                budget_str = f"${int(b_min)}–${int(b_max)} {currency}" if b_max else f"${int(b_min)}+ {currency}"
+                    async def _get_page(off: int) -> tuple[int, list]:
+                        r = await client.get(API_URL, params={
+                            **BASE_PARAMS,
+                            "query":  search_query,
+                            "limit":  PAGE_SIZE,
+                            "offset": off,
+                            "_t":     str(int(time.time())),
+                        })
+                        r.raise_for_status()
+                        return off, r.json().get("result", {}).get("projects", [])
 
-                skills = [j.get("name", "") for j in p.get("jobs", []) if j.get("name")]
+                    raw_results = await asyncio.gather(
+                        *[_get_page(off) for off in batch_offsets],
+                        return_exceptions=True,
+                    )
+                    pages_fetched += len(batch_offsets)
 
-                country = ""
-                owner = p.get("owner", {})
-                if isinstance(owner, dict):
-                    country = owner.get("country", "") or ""
+                    hit_empty = False
+                    for res in raw_results:
+                        if isinstance(res, httpx.HTTPStatusError):
+                            blocked_code = res.response.status_code
+                            raise res
+                        if isinstance(res, Exception):
+                            logger.warning(f"[freelancer] Batch page error: {res}")
+                            hit_empty = True
+                            continue
+                        _, page_raw = res
+                        if not page_raw:
+                            hit_empty = True
+                            continue
+                        for raw_p in page_raw:
+                            parsed = _parse_freelancer_project(raw_p)
+                            if parsed and parsed.id not in seen_ids:
+                                seen_ids.add(parsed.id)
+                                all_projects.append(parsed)
 
-                bid_stats = p.get("bid_stats", {})
-                bid_count = bid_stats.get("bid_count") if isinstance(bid_stats, dict) else None
+                    if hit_empty:
+                        break
 
-                submitted = p.get("time_submitted", 0)
-                if submitted:
-                    posted_dt = datetime.utcfromtimestamp(submitted)
-                    posted_str = posted_dt.strftime("%b %d, %Y")
-                else:
-                    posted_str = "Unknown"
+                    offset += PAGE_SIZE * BATCH_SIZE
+                    if len(all_projects) < MAX_PROJECTS:
+                        await asyncio.sleep(0.35)
 
-                project_id = str(p.get("id", uuid.uuid4()))
-                seo_url = p.get("seo_url", "")
-                project_url = (
-                    f"https://www.freelancer.com/projects/{seo_url}"
-                    if seo_url
-                    else f"https://www.freelancer.com/projects/{project_id}"
-                )
-
-                desc = p.get("description", "") or ""
-                desc = desc.strip()[:500] + ("..." if len(desc) > 500 else "")
-
-                result.append(ScrapedProject(
-                    id=f"fl_{project_id}",
-                    title=p.get("title", "Untitled"),
-                    description=desc,
-                    budget=budget_str,
-                    skills=skills[:8],
-                    clientCountry=country,
-                    clientRating=None,
-                    postedAt=posted_str,
-                    url=project_url,
-                    platform="freelancer",
-                    proposalsCount=bid_count,
-                ))
-            except Exception as e:
-                logger.warning(f"[freelancer] Error parsing project: {e}")
-                continue
-
-        status = "success" if result else "empty"
-        return PlatformResult(projects=result, status=status)
+        elapsed = int((time.time() - start_time) * 1000)
+        logger.info(
+            f"[freelancer-scrape] '{query}' → {len(all_projects)} projects, "
+            f"{pages_fetched} pages, {elapsed}ms (queries: {expanded_queries})"
+        )
+        return PlatformResult(
+            projects=all_projects,
+            status="success" if all_projects else "empty",
+        )
 
     except httpx.HTTPStatusError as e:
-        logger.error(f"[freelancer] HTTP {e.response.status_code}: {e}")
+        code = blocked_code or e.response.status_code
+        logger.error(f"[freelancer] HTTP {code}: {e}")
         return PlatformResult(
-            projects=[],
-            status="platform_blocked" if e.response.status_code in (403, 410, 429) else "error",
-            message=f"Freelancer API returned HTTP {e.response.status_code}",
+            projects=all_projects,  # return whatever was collected before block
+            status="platform_blocked" if code in _PLATFORM_BLOCK_CODES else "error",
+            message=f"Freelancer API returned HTTP {code}",
         )
     except Exception as e:
         logger.error(f"[freelancer] Scrape error: {e}")
-        return PlatformResult(projects=[], status="error", message=str(e))
+        return PlatformResult(projects=all_projects, status="error" if not all_projects else "success", message=str(e))
 
 
 # ── Upwork ────────────────────────────────────────────────────────────────────
@@ -356,86 +501,105 @@ async def scrape_upwork_rss(query: str, limit: int) -> list[ScrapedProject]:
     """
     import xml.etree.ElementTree as ET
 
+    PAGE_SIZE   = 50
+    MAX_PAGES   = 4  # up to 200 results via RSS
     url = "https://www.upwork.com/ab/feed/jobs/rss"
-    params = {
-        "q":      query,
-        "sort":   "recency",
-        "paging": f"0;{min(limit, 50)}",
-    }
+
+    def _parse_items(root: ET.Element, seen_ids: set[str]) -> list[ScrapedProject]:
+        channel = root.find("channel")
+        if not channel:
+            return []
+        items: list[ScrapedProject] = []
+        for item in channel.findall("item"):
+            title    = (item.findtext("title") or "").strip()
+            link     = (item.findtext("link")  or "").strip()
+            desc     = (item.findtext("description") or "").strip()
+            pub_date = (item.findtext("pubDate") or "Unknown").strip()
+            if not title or not link:
+                continue
+            job_id = link.split("~")[-1].split("?")[0] if "~" in link else str(uuid.uuid4())
+            uid = f"uw_{job_id}"
+            if uid in seen_ids:
+                continue
+            seen_ids.add(uid)
+
+            budget = "Negotiable"
+            m = re.search(r'(?:Budget|Hourly Range)[:\s]+(\$[\d,./\-]+(?:\s*/hr)?)', desc, re.IGNORECASE)
+            if m:
+                budget = m.group(1).strip()
+
+            skills: list[str] = []
+            ms = re.search(r'Skills:\s*([^\n<]+)', desc, re.IGNORECASE)
+            if ms:
+                skills = [s.strip() for s in ms.group(1).split(",") if s.strip()][:8]
+
+            clean_desc = re.sub(r'<[^>]+>', ' ', desc).strip()
+            clean_desc = re.sub(r'\s+', ' ', clean_desc)[:500]
+
+            items.append(ScrapedProject(
+                id=uid,
+                title=title,
+                description=clean_desc + ("..." if len(clean_desc) == 500 else ""),
+                budget=budget,
+                skills=skills,
+                clientCountry="",
+                clientRating=None,
+                postedAt=pub_date,
+                url=link,
+                platform="upwork",
+                proposalsCount=None,
+            ))
+        return items
+
     try:
+        cap        = min(max(limit, 100), MAX_PAGES * PAGE_SIZE)
+        result:    list[ScrapedProject] = []
+        seen_ids:  set[str] = set()
+
         async with httpx.AsyncClient(timeout=20, headers=HEADERS, follow_redirects=True) as client:
-            resp = await client.get(url, params=params)
-            if resp.status_code != 200:
-                logger.warning(f"[upwork-rss] HTTP {resp.status_code}")
-                return []
+            for page in range(MAX_PAGES):
+                if len(result) >= cap:
+                    break
+                offset = page * PAGE_SIZE
+                params = {
+                    "q":      query,
+                    "sort":   "recency",
+                    "paging": f"{offset};{PAGE_SIZE}",
+                }
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    logger.warning(f"[upwork-rss] page {page} HTTP {resp.status_code}")
+                    break
 
-            content_type = resp.headers.get("content-type", "")
-            if "html" in content_type.lower():
-                logger.warning("[upwork-rss] Got HTML instead of RSS — Cloudflare block")
-                return []
+                content_type = resp.headers.get("content-type", "")
+                if "html" in content_type.lower():
+                    logger.warning("[upwork-rss] Got HTML instead of RSS — Cloudflare block")
+                    break
 
-            root = ET.fromstring(resp.text)
-            channel = root.find("channel")
-            if not channel:
-                return []
+                root = ET.fromstring(resp.text)
+                page_items = _parse_items(root, seen_ids)
+                result.extend(page_items)
+                logger.info(f"[upwork-rss] page {page} → {len(page_items)} jobs (total {len(result)})")
 
-            result: list[ScrapedProject] = []
-            for item in channel.findall("item")[:limit]:
-                title    = (item.findtext("title") or "").strip()
-                link     = (item.findtext("link")  or "").strip()
-                desc     = (item.findtext("description") or "").strip()
-                pub_date = (item.findtext("pubDate") or "Unknown").strip()
+                if len(page_items) < PAGE_SIZE:
+                    break  # last page — no more results
 
-                if not title or not link:
-                    continue
-
-                budget = "Negotiable"
-                m = re.search(r'(?:Budget|Hourly Range)[:\s]+(\$[\d,./\-]+(?:\s*/hr)?)', desc, re.IGNORECASE)
-                if m:
-                    budget = m.group(1).strip()
-
-                skills: list[str] = []
-                ms = re.search(r'Skills:\s*([^\n<]+)', desc, re.IGNORECASE)
-                if ms:
-                    skills = [s.strip() for s in ms.group(1).split(",") if s.strip()][:8]
-
-                job_id = link.split("~")[-1].split("?")[0] if "~" in link else str(uuid.uuid4())
-                clean_desc = re.sub(r'<[^>]+>', ' ', desc).strip()
-                clean_desc = re.sub(r'\s+', ' ', clean_desc)[:500]
-
-                result.append(ScrapedProject(
-                    id=f"uw_{job_id}",
-                    title=title,
-                    description=clean_desc + ("..." if len(clean_desc) == 500 else ""),
-                    budget=budget,
-                    skills=skills,
-                    clientCountry="",
-                    clientRating=None,
-                    postedAt=pub_date,
-                    url=link,
-                    platform="upwork",
-                    proposalsCount=None,
-                ))
-
-            logger.info(f"[upwork-rss] Retrieved {len(result)} jobs for query={query!r}")
-            return result
+        logger.info(f"[upwork-rss] Retrieved {len(result)} jobs for query={query!r}")
+        return result[:cap]
 
     except Exception as e:
         logger.error(f"[upwork-rss] Error: {e}")
         return []
 
 
-# HTTP status codes that mean the platform endpoint is gone / blocked — not a
-# scraper failure.  These must NOT trigger a 503 on the backend side.
-_PLATFORM_BLOCK_CODES = {403, 404, 410, 429, 451}
 
-
-async def scrape_upwork(query: str, limit: int) -> PlatformResult:
+async def scrape_upwork(query: str, limit: int, user_id: Optional[str] = None) -> PlatformResult:
     """
     Fetch Upwork jobs.  Tries three strategies in order:
 
     1. RSS feed  (/ab/feed/jobs/rss)  — no auth, most reliable
     2. NX search page HTTP  (/nx/search/jobs/)  — parse __NEXT_DATA__ JSON
+       • Uses stored session cookies + DB cookies for the authenticated user
        • If returns 410/403/429 → platform is blocking; skip to step 3 immediately
        • If returns 200 → parse and return
     3. nodriver browser (Cloudflare-bypass Chrome)
@@ -449,8 +613,17 @@ async def scrape_upwork(query: str, limit: int) -> PlatformResult:
 
     logger.info("[upwork] RSS returned 0 results, trying NX search HTTP endpoint")
 
-    # 2. NX HTTP endpoint
+    # 2. NX HTTP endpoint — merge file session cookies with DB cookies for the user
     session_cookies = _load_session_cookies("upwork")
+    if user_id:
+        db_cookies = await _fetch_user_cookies(user_id, "upwork")
+        if db_cookies:
+            session_cookies = {**session_cookies, **db_cookies}
+            logger.info(f"[upwork-scrape] Using authenticated session from DB for user {user_id}")
+        else:
+            logger.info(f"[upwork-scrape] No DB cookies for user {user_id}, using file session only")
+    else:
+        logger.info("[upwork-scrape] Unauthenticated scrape (no user_id)")
     http_blocked = False
 
     try:
@@ -546,21 +719,30 @@ async def scrape_upwork(query: str, limit: int) -> PlatformResult:
         logger.info(f"[upwork] nodriver success — {len(nodriver_results)} jobs")
         return PlatformResult(projects=nodriver_results, status="success")
 
-    # All methods failed
-    if http_blocked:
+    # All methods failed — pick the most accurate error code
+    has_cookies = bool(session_cookies)
+
+    if user_id and not has_cookies:
+        # User is logged in but no session was found for this platform
+        error_code = "UPWORK_NOT_CONNECTED"
+        msg = "No Upwork session found. Connect your account in Profile for results."
+    elif http_blocked and has_cookies:
+        # Had cookies but platform still blocked → cookies likely expired
+        error_code = "UPWORK_COOKIES_EXPIRED"
+        msg = "Your Upwork session has expired. Reconnect in Profile to resume."
+    elif http_blocked:
+        # No cookies, CF block
+        error_code = "UPWORK_CLOUDFLARE_BLOCK"
         msg = (
-            "Upwork is blocking automated HTTP requests (endpoint returned "
-            f"{resp.status_code if 'resp' in dir() else 'error'}). "  # type: ignore[name-defined]
-            "Connect your Upwork account in Profile for authenticated results."
+            "Upwork is blocking automated HTTP requests. "
+            "Connect your account in Profile for authenticated results."
         )
     else:
-        msg = (
-            "All Upwork scraping methods returned 0 results. "
-            "The session may be expired — reconnect on the Profile page."
-        )
+        error_code = "UPWORK_CLOUDFLARE_BLOCK"
+        msg = "All Upwork scraping methods returned 0 results. The session may be expired."
 
-    logger.error(f"[upwork] All methods failed for query={query!r}: {msg}")
-    return PlatformResult(projects=[], status="platform_blocked", message=msg)
+    logger.error(f"[upwork] All methods failed for query={query!r}: {error_code}")
+    return PlatformResult(projects=[], status="platform_blocked", message=msg, error_code=error_code)
 
 
 async def scrape_upwork_playwright(query: str, limit: int) -> list[ScrapedProject]:
@@ -961,7 +1143,7 @@ async def scrape(req: ScrapeRequest) -> dict:
     if req.platform in ("freelancer", "both"):
         freelancer_task = asyncio.create_task(scrape_freelancer(req.query, limit_per))
     if req.platform in ("upwork", "both"):
-        upwork_task = asyncio.create_task(scrape_upwork(req.query, limit_per))
+        upwork_task = asyncio.create_task(scrape_upwork(req.query, limit_per, req.user_id))
 
     all_projects: list[ScrapedProject] = []
     platform_outcomes: dict = {}
@@ -973,9 +1155,10 @@ async def scrape(req: ScrapeRequest) -> dict:
             result: PlatformResult = await task
             all_projects.extend(result.projects)
             platform_outcomes[platform_name] = {
-                "status":  result.status,
-                "count":   len(result.projects),
-                "message": result.message,
+                "status":     result.status,
+                "count":      len(result.projects),
+                "message":    result.message,
+                "error_code": result.error_code,
             }
             logger.info(
                 f"[scrape] {platform_name}: status={result.status} count={len(result.projects)}"
@@ -983,9 +1166,10 @@ async def scrape(req: ScrapeRequest) -> dict:
         except Exception as e:
             logger.error(f"[scrape] {platform_name} task raised exception: {e}")
             platform_outcomes[platform_name] = {
-                "status":  "error",
-                "count":   0,
-                "message": str(e),
+                "status":     "error",
+                "count":      0,
+                "message":    str(e),
+                "error_code": "",
             }
 
     logger.info(
@@ -994,10 +1178,10 @@ async def scrape(req: ScrapeRequest) -> dict:
     )
 
     return {
-        "projects":        [p.model_dump() for p in all_projects[:req.limit]],
-        "total":           len(all_projects),
-        "query":           req.query,
-        "platform":        req.platform,
+        "projects":         [p.model_dump() for p in all_projects],
+        "total":            len(all_projects),
+        "query":            req.query,
+        "platform":         req.platform,
         "platformOutcomes": platform_outcomes,
     }
 

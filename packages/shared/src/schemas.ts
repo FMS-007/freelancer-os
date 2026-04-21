@@ -59,8 +59,13 @@ export const ProposalStatusSchema = z.object({
 export const AnalyzeProjectSchema = z.object({
   projectTitle: z.string().min(1),
   projectDescription: z.string().min(20),
+  projectUrl: z.string().optional(),
   clientCountry: z.string().optional(),
   clientTimezone: z.string().optional(),
+  paymentVerified: z.boolean().optional(),
+  emailVerified: z.boolean().optional(),
+  phoneVerified: z.boolean().optional(),
+  proposalsCount: z.number().int().nonnegative().optional(),
 });
 
 // ── Alert Config ──────────────────────────────────────────────────────────────
@@ -77,7 +82,7 @@ export const AlertConfigSchema = z.object({
 export const ScraperQuerySchema = z.object({
   query: z.string().min(1),
   platform: z.enum(['upwork', 'freelancer', 'both']).default('both'),
-  limit: z.number().min(1).max(50).default(20),
+  limit: z.number().min(1).max(1000).default(50),
 });
 
 export type SignupInput = z.infer<typeof SignupSchema>;

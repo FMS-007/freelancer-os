@@ -6,7 +6,6 @@ import Layout from './components/layout/Layout';
 import Login from './pages/auth/Login';
 import Signup from './pages/auth/Signup';
 import Dashboard from './pages/Dashboard';
-import Proposals from './pages/Proposals';
 import Templates from './pages/Templates';
 import AIAnalyze from './pages/AIAnalyze';
 import Records from './pages/Records';
@@ -94,8 +93,8 @@ export default function App() {
           {/* Protected */}
           <Route path="/" element={<PrivateRoute><Layout /></PrivateRoute>}>
             <Route index element={<Dashboard />} />
-            <Route path="proposals" element={<Proposals />} />
-            <Route path="templates" element={<Templates />} />
+            <Route path="instructions" element={<Templates />} />
+            <Route path="templates" element={<Navigate to="/instructions" replace />} />
             <Route path="ai-analyze" element={<AIAnalyze />} />
             <Route path="records" element={<Records />} />
             <Route path="alerts" element={<Alerts />} />

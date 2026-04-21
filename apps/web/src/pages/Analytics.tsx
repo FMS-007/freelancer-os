@@ -66,7 +66,7 @@ export default function Analytics() {
   })) ?? [];
 
   return (
-    <div className="p-6 max-w-7xl mx-auto">
+    <div className="page-shell">
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-dark flex items-center gap-2">
           <BarChart2 size={22} className="text-primary" /> Analytics

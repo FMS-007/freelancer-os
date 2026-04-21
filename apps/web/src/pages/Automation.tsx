@@ -18,12 +18,13 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import {
   Bot, Play, Square, FlaskConical, CheckCircle2, AlertCircle, Clock,
   SlidersHorizontal, ExternalLink, DollarSign, Globe, Users, Brain,
   Bookmark, BookmarkCheck, X, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, RefreshCw,
-  Link2, Zap, Star,
+  Link2, Zap, Star, Puzzle,
 } from 'lucide-react';
 import { scraperApi } from '../lib/api';
 import type { ScrapedProject } from '@freelancer-os/shared';
@@ -212,9 +213,11 @@ export default function Automation() {
   const [matchedPage,    setMatchedPage]    = useState(1);
   const [showSavedPanel, setShowSavedPanel] = useState(false);
 
-  const intervalRef  = useRef<ReturnType<typeof setInterval> | null>(null);
-  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const nextFireRef  = useRef<number | null>(null);
+  const intervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const nextFireRef    = useRef<number | null>(null);
+  const runCycleRef    = useRef<((manual?: boolean) => Promise<void>) | null>(null);
+  const seenAutoTsRef  = useRef<Set<string>>(new Set());
 
   // Scraper online status
   const [scraperOnline, setScraperOnline] = useState<boolean | null>(null);
@@ -224,6 +227,19 @@ export default function Automation() {
       .then(d => setScraperOnline(d?.status === 'online'))
       .catch(() => setScraperOnline(false));
   }, []);
+
+  // Extension detection (same as Scraper.tsx)
+  const [extensionInstalled, setExtensionInstalled] = useState(false);
+  const [extensionStatus,    setExtensionStatus]    = useState('');
+
+  useEffect(() => {
+    const win = window as Window & { __FOS_EXTENSION_INSTALLED__?: boolean };
+    if (win.__FOS_EXTENSION_INSTALLED__) { setExtensionInstalled(true); return; }
+    const t = setTimeout(() => { if (win.__FOS_EXTENSION_INSTALLED__) setExtensionInstalled(true); }, 800);
+    return () => clearTimeout(t);
+  }, []);
+
+  // Extension event listener wired up after addLog is defined (see below)
 
   // Load saved projects from DB on mount (syncs across sessions)
   useEffect(() => {
@@ -277,6 +293,93 @@ export default function Automation() {
   const addLog = useCallback((message: string, type: RunLog['type'] = 'info') => {
     setLogs(prev => [{ ts: fmt(new Date()), message, type }, ...prev].slice(0, 50));
   }, []);
+
+  // Listen for extension scrape events — wired here so addLog is already declared
+  useEffect(() => {
+    function onScrapeEvent(e: Event) {
+      const msg = (e as CustomEvent<{ type: string; message?: string }>).detail;
+      if (msg.type === 'SCRAPE_STATUS') {
+        setExtensionStatus(msg.message || 'Extension scraping…');
+        addLog(`Extension: ${msg.message || 'Scraping…'}`, 'info');
+      } else if (msg.type === 'SCRAPE_DONE') {
+        setExtensionStatus('');
+        setRunning(false);
+      }
+    }
+    window.addEventListener('FOS_SCRAPE_EVENT', onScrapeEvent);
+    return () => window.removeEventListener('FOS_SCRAPE_EVENT', onScrapeEvent);
+  }, [addLog]);
+
+  // ── Extension auto-results polling ────────────────────────────────────────────
+
+  const { data: autoResultsData } = useQuery({
+    queryKey: ['automation-auto-results'],
+    queryFn: scraperApi.getAutoResults,
+    refetchInterval: 10000,
+    staleTime: 0,
+  });
+
+  useEffect(() => {
+    if (!autoResultsData) return;
+
+    if (Array.isArray(autoResultsData.logs)) {
+      const newEntries: RunLog[] = [];
+      for (const l of autoResultsData.logs as Array<{ ts: string; platform: string; query: string; count: number }>) {
+        if (seenAutoTsRef.current.has(l.ts)) continue;
+        seenAutoTsRef.current.add(l.ts);
+        newEntries.push({
+          ts: fmt(new Date(l.ts)),
+          message: `[Extension auto-scrape] ${l.count} project(s) for "${l.query}" on ${l.platform}`,
+          type: 'success',
+        });
+      }
+      if (newEntries.length > 0) {
+        setLogs(prev => [...newEntries, ...prev].slice(0, 50));
+      }
+    }
+
+    if (Array.isArray(autoResultsData.projects) && autoResultsData.projects.length > 0) {
+      // Apply automation filters — only matched projects flow in, then auto-save
+      const incomingProjects = autoResultsData.projects as ScrapedProject[];
+      const filtered = config.query.trim()
+        ? incomingProjects.filter(p => matchesConfig(p, config))
+        : incomingProjects;
+
+      setMatchedProjects(prev => {
+        const existingIds = new Set(prev.map(p => p.id));
+        const newOnes = filtered.filter(p => !existingIds.has(p.id));
+        if (newOnes.length > 0) {
+          setTimeout(() => addLog(`[Extension] ${newOnes.length} new project(s) matched filters → auto-saved`, 'success'), 0);
+        }
+        return newOnes.length > 0 ? [...newOnes, ...prev] : prev;
+      });
+
+      // Auto-save filtered matches to DB
+      setSavedProjects(prev => {
+        const existingIds = new Set(prev.map(p => p.id));
+        const toSave = filtered.filter(p => !existingIds.has(p.id));
+        toSave.forEach(p => {
+          scraperApi.saveProject({
+            id: p.id, title: p.title, description: p.description,
+            budget: p.budget, skills: p.skills, clientCountry: p.clientCountry,
+            url: p.url, platform: p.platform,
+          }).catch(() => {});
+        });
+        return toSave.length > 0 ? [...toSave, ...prev] : prev;
+      });
+    }
+  }, [autoResultsData, config, addLog]);
+
+  // ── Extension trigger helper ──────────────────────────────────────────────
+
+  function triggerExtScrape(query: string, platform: string) {
+    if (!extensionInstalled) return;
+    window.dispatchEvent(new CustomEvent('FOS_SCRAPE_REQUEST', {
+      detail: { query, platform: platform || 'both' },
+    }));
+    setExtensionStatus('Extension scraping…');
+    addLog(`Triggered extension scrape for "${query}" on ${platform}`, 'info');
+  }
 
   // ── Run cycle ────────────────────────────────────────────────────────────────
 
@@ -375,19 +478,27 @@ export default function Automation() {
 
       setLastRun(fmt(new Date()));
     } catch (err: unknown) {
-      // Only reach here if the scraper service itself is unreachable (connection refused)
       const isOffline =
         err instanceof Error &&
         (err.message.includes('503') || err.message.includes('Network') || err.message.includes('ECONNREFUSED'));
-      if (isOffline) {
-        addLog('Scraper service is offline — start it with: python api.py', 'error');
+      if (isOffline && extensionInstalled) {
+        addLog('Scraper offline — using extension as fallback', 'warn');
+        triggerExtScrape(config.query, config.platform);
+        // runCycle stays running=true until FOS_SCRAPE_EVENT SCRAPE_DONE fires
+        return;
+      } else if (isOffline) {
+        addLog('Scraper service is offline. Install the Freelancer OS extension or start python api.py', 'error');
       } else {
         addLog(`Cycle error: ${err instanceof Error ? err.message : String(err)}`, 'error');
       }
     } finally {
       setRunning(false);
     }
-  }, [running, config, addLog]);
+  }, [running, config, addLog, extensionInstalled]);
+
+  // Keep ref in sync so the scheduler can call the latest version without
+  // being listed as a useEffect dependency (avoids interval reset on every cycle).
+  useEffect(() => { runCycleRef.current = runCycle; }, [runCycle]);
 
   // ── Scheduler ────────────────────────────────────────────────────────────────
 
@@ -405,7 +516,7 @@ export default function Automation() {
 
     intervalRef.current = setInterval(() => {
       nextFireRef.current = Date.now() + ms;
-      runCycle(false);
+      runCycleRef.current?.(false);
     }, ms);
 
     countdownRef.current = setInterval(() => {
@@ -420,7 +531,7 @@ export default function Automation() {
       if (intervalRef.current)  clearInterval(intervalRef.current);
       if (countdownRef.current) clearInterval(countdownRef.current);
     };
-  }, [enabled, config.intervalMinutes, runCycle]);
+  }, [enabled, config.intervalMinutes]); // runCycle intentionally omitted — called via runCycleRef
 
   // ── Config helpers ────────────────────────────────────────────────────────────
 
@@ -466,6 +577,13 @@ export default function Automation() {
   function unsaveProject(id: string) {
     setSavedProjects(prev => prev.filter(p => p.id !== id));
     scraperApi.deleteSaved(id).catch(() => {});
+  }
+
+  function clearSavedProjects() {
+    savedProjects.forEach(p => {
+      scraperApi.deleteSaved(p.id).catch(() => {});
+    });
+    setSavedProjects([]);
   }
 
   function goToAnalyze(p: ScrapedProject) {
@@ -531,7 +649,7 @@ export default function Automation() {
   return (
     <div className="flex h-full overflow-hidden">
     <div className="flex-1 overflow-y-auto">
-    <div className="p-6 max-w-6xl mx-auto">
+    <div className="page-shell">
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <div className="flex items-start justify-between mb-6 gap-4 flex-wrap">
@@ -581,6 +699,13 @@ export default function Automation() {
                 ? 'Scraper Offline'
                 : 'Checking...'}
           </span>
+
+          {/* Extension indicator */}
+          {extensionInstalled && (
+            <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border bg-primary/5 border-primary/20 text-primary">
+              <Puzzle size={10} /> Extension Active
+            </span>
+          )}
         </div>
       </div>
 
@@ -905,13 +1030,13 @@ export default function Automation() {
             <div className="flex items-center gap-3 flex-wrap">
               <button
                 onClick={handleToggleEnable}
-                disabled={scraperOnline === false}
+                disabled={scraperOnline === false && !extensionInstalled}
                 className={clsx(
                   'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors border',
                   enabled
                     ? 'bg-red-50 border-red-200 text-red-600 hover:bg-red-100'
                     : 'btn-primary',
-                  scraperOnline === false && 'opacity-50 cursor-not-allowed',
+                  (scraperOnline === false && !extensionInstalled) && 'opacity-50 cursor-not-allowed',
                 )}
               >
                 {enabled
@@ -921,22 +1046,27 @@ export default function Automation() {
 
               <button
                 onClick={handleTest}
-                disabled={running || scraperOnline === false}
+                disabled={running || (scraperOnline === false && !extensionInstalled)}
                 className={clsx(
                   'flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors',
                   'bg-white border-slate-200 text-slate-600 hover:border-primary/40 hover:text-primary',
-                  (running || scraperOnline === false) && 'opacity-50 cursor-not-allowed',
+                  (running || (scraperOnline === false && !extensionInstalled)) && 'opacity-50 cursor-not-allowed',
                 )}
-                title="Run one cycle immediately (ignores time window)"
+                title={extensionInstalled ? 'Run one cycle via extension (ignores time window)' : 'Run one cycle immediately (ignores time window)'}
               >
                 {running
-                  ? <><RefreshCw size={12} className="animate-spin" /> Running...</>
+                  ? <><RefreshCw size={12} className="animate-spin" /> {extensionStatus || 'Running...'}</>
                   : <><FlaskConical size={12} /> Test Now</>}
               </button>
 
-              {scraperOnline === false && (
+              {scraperOnline === false && !extensionInstalled && (
                 <p className="text-xs text-red-500 flex items-center gap-1">
-                  <AlertCircle size={11} /> Start the scraper first
+                  <AlertCircle size={11} /> Start the scraper or install the extension
+                </p>
+              )}
+              {scraperOnline === false && extensionInstalled && (
+                <p className="text-xs text-primary flex items-center gap-1">
+                  <CheckCircle2 size={11} /> Extension active — scraper not required
                 </p>
               )}
             </div>
@@ -1154,9 +1284,19 @@ export default function Automation() {
             <BookmarkCheck size={14} className="text-primary" />
             Saved Projects ({savedProjects.length})
           </p>
-          <button onClick={() => setShowSavedPanel(false)} className="text-slate-400 hover:text-slate-600">
-            <X size={14} />
-          </button>
+          <div className="flex items-center gap-2">
+            {savedProjects.length > 0 && (
+              <button
+                onClick={clearSavedProjects}
+                className="text-[11px] text-slate-500 hover:text-red-500 transition-colors"
+              >
+                Clear all
+              </button>
+            )}
+            <button onClick={() => setShowSavedPanel(false)} className="text-slate-400 hover:text-slate-600">
+              <X size={14} />
+            </button>
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto">

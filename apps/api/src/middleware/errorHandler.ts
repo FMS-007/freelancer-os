@@ -16,6 +16,12 @@ export function errorHandler(
   }
 
   if (err instanceof Error) {
+    const multerErr = err as Error & { code?: string };
+    if (multerErr.code === 'LIMIT_FILE_SIZE') {
+      res.status(413).json({ error: 'Avatar must be 5MB or smaller' });
+      return;
+    }
+
     const status = (err as Error & { status?: number }).status || 500;
     const message = status < 500 ? err.message : 'Internal server error';
 

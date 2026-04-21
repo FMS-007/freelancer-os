@@ -17,6 +17,10 @@ export default defineConfig({
         target: 'http://localhost:3001',
         changeOrigin: true,
       },
+      '/uploads': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+      },
       // Proxy scraper service so the browser can reach it without CORS issues
       '/scraper-api': {
         target: 'http://localhost:8001',

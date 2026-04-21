@@ -215,6 +215,12 @@ def _is_post_login(platform: str, url: str) -> bool:
         logger.info(f"[worker] ACCEPT (fallback domain match) — {path_only!r}")
         return True
 
+    # Bare root domain after being away from auth page = also accepted
+    # (Upwork sometimes redirects to https://www.upwork.com/ after login)
+    if is_root:
+        logger.info(f"[worker] ACCEPT (root domain after auth) — {path_only!r}")
+        return True
+
     return False
 
 
@@ -386,22 +392,36 @@ def main() -> None:
                 pass
 
             login_detected = [False]
-            session_cookie_names = {
+
+            # Only cookies that are ONLY present when authenticated (not set for anon visitors)
+            # visitor_id / recognized are set for ALL users — exclude them
+            auth_cookie_names = {
                 "freelancer": {"PHPSESSID", "fl_session", "fl_auth", "freelancer_token"},
-                "upwork":     {"user_uid", "oauth2_global_js_token", "visitor_id", "recognized"},
+                "upwork":     {"user_uid", "oauth2_global_js_token"},
             }
 
-            def on_framenavigated(frame):
-                try:
-                    # Use frame.url (not page.url) — more reliable during transitions
-                    current = frame.url
-                    if not login_detected[0] and _is_post_login(platform, current):
-                        login_detected[0] = True
-                        logger.info(f"[worker] ✓ Login detected (nav event) — {current}")
-                except Exception as e:
-                    logger.debug(f"[worker] Nav-event error: {e}")
+            # Track ALL pages opened in this context (Upwork may open a new tab after login)
+            all_pages: list = [page]
 
-            page.on("framenavigated", on_framenavigated)
+            def _attach_nav_listener(p) -> None:
+                def on_nav(frame):
+                    try:
+                        current = frame.url
+                        if not login_detected[0] and _is_post_login(platform, current):
+                            login_detected[0] = True
+                            logger.info(f"[worker] ✓ Login detected (nav event) — {current}")
+                    except Exception as e:
+                        logger.debug(f"[worker] Nav-event error: {e}")
+                p.on("framenavigated", on_nav)
+
+            _attach_nav_listener(page)
+
+            def on_new_context_page(new_page) -> None:
+                all_pages.append(new_page)
+                logger.info(f"[worker] New tab/page opened: {new_page.url}")
+                _attach_nav_listener(new_page)
+
+            context.on("page", on_new_context_page)
 
             MAX_WAIT = 300  # 5 minutes
             consecutive_errors = 0
@@ -409,28 +429,57 @@ def main() -> None:
                 if login_detected[0]:
                     break
                 try:
-                    # Use JS window.location.href for SPA-accurate URL
-                    try:
-                        current = page.evaluate("() => window.location.href")
-                    except Exception:
-                        current = page.url
-                    detected = _is_post_login(platform, current)
-                    logger.info(f"[worker] [{tick}s] URL={current!r} detected={detected}")
-                    if detected:
-                        login_detected[0] = True
-                        logger.info(f"[worker] ✓ Login detected (URL poll) — {current}")
+                    # Check ALL open pages/tabs — Upwork may navigate in a new tab.
+                    # Use page.url (Playwright committed URL) as primary — it is always
+                    # up to date even during SPA navigation.  Fall back to evaluate()
+                    # as an enhancement for SPA pushState that Playwright hasn't committed.
+                    for p in list(all_pages):
+                        try:
+                            current = p.url  # primary: always accurate, never throws
+                        except Exception:
+                            continue
+                        # Optionally enhance with JS location.href for SPA pushState
+                        try:
+                            js_url = p.evaluate("() => window.location.href")
+                            if js_url and isinstance(js_url, str) and js_url.startswith("http"):
+                                current = js_url
+                        except Exception:
+                            pass  # keep page.url value
+
+                        detected = _is_post_login(platform, current)
+                        logger.info(f"[worker] [{tick}s] URL={current!r} detected={detected}")
+                        if detected:
+                            login_detected[0] = True
+                            logger.info(f"[worker] ✓ Login detected (URL poll) — {current}")
+                            break
+
+                    if login_detected[0]:
                         break
-                    # Cookie-based fallback: check for session cookies after first 5s
+
+                    # Cookie-based fallback: reliable auth cookies only (not visitor cookies)
                     if tick >= 5:
                         cookies_now = context.cookies()
-                        found = {c["name"] for c in cookies_now} & session_cookie_names.get(platform, set())
-                        domain_map = {"freelancer": "freelancer.com", "upwork": "upwork.com"}
-                        on_domain = domain_map.get(platform, "") in current
-                        not_on_auth = not any(f in current for f in _AUTH_FLOW_FRAGMENTS.get(platform, []))
-                        if found and on_domain and not_on_auth:
-                            login_detected[0] = True
-                            logger.info(f"[worker] ✓ Login detected (session cookie {found}) — {current}")
-                            break
+                        found = {c["name"] for c in cookies_now} & auth_cookie_names.get(platform, set())
+                        if found:
+                            # Any page in context on the platform domain and NOT on auth page?
+                            domain_key = {"freelancer": "freelancer.com", "upwork": "upwork.com"}.get(platform, "")
+                            for p in list(all_pages):
+                                try:
+                                    cur = p.evaluate("() => window.location.href")
+                                except Exception:
+                                    cur = getattr(p, "url", "")
+                                on_domain    = domain_key in cur
+                                not_on_auth  = not any(f in cur for f in _AUTH_FLOW_FRAGMENTS.get(platform, []))
+                                if on_domain and not_on_auth:
+                                    login_detected[0] = True
+                                    logger.info(
+                                        f"[worker] ✓ Login detected (auth cookie {found}) — {cur}"
+                                    )
+                                    break
+
+                    if login_detected[0]:
+                        break
+
                     consecutive_errors = 0
                 except Exception as e:
                     consecutive_errors += 1
@@ -444,20 +493,33 @@ def main() -> None:
             if not login_detected[0]:
                 time.sleep(5)
                 try:
-                    current = page.url
-                    logger.info(f"[worker] Grace check URL: {current!r}")
-                    if _is_post_login(platform, current):
-                        login_detected[0] = True
-                        logger.info(f"[worker] ✓ Login detected (grace check) — {current}")
-                    else:
-                        # Last resort: any session cookie on the domain = logged in
+                    domain_key = {"freelancer": "freelancer.com", "upwork": "upwork.com"}.get(platform, "")
+                    # Check all pages (original + any new tabs opened during login)
+                    for p in list(all_pages):
+                        try:
+                            current = p.url
+                        except Exception:
+                            continue
+                        try:
+                            js_url = p.evaluate("() => window.location.href")
+                            if js_url and isinstance(js_url, str) and js_url.startswith("http"):
+                                current = js_url
+                        except Exception:
+                            pass
+                        logger.info(f"[worker] Grace check URL: {current!r}")
+                        if _is_post_login(platform, current):
+                            login_detected[0] = True
+                            logger.info(f"[worker] ✓ Login detected (grace URL) — {current}")
+                            break
+                        # Last resort: authoritative auth cookies present + off the auth page
                         cookies_now = context.cookies()
-                        found = {c["name"] for c in cookies_now} & session_cookie_names.get(platform, set())
-                        domain_map = {"freelancer": "freelancer.com", "upwork": "upwork.com"}
-                        on_domain = domain_map.get(platform, "") in current
-                        if found and on_domain:
+                        found = {c["name"] for c in cookies_now} & auth_cookie_names.get(platform, set())
+                        on_domain   = domain_key in current
+                        not_on_auth = not any(f in current for f in _AUTH_FLOW_FRAGMENTS.get(platform, []))
+                        if found and on_domain and not_on_auth:
                             login_detected[0] = True
                             logger.info(f"[worker] ✓ Login detected (grace cookie {found}) — {current}")
+                            break
                 except Exception:
                     pass
 
@@ -486,7 +548,12 @@ def main() -> None:
             except Exception as e:
                 logger.warning(f"[worker] Could not save session: {e}")
 
-            username = _extract_username(page, platform)
+            # Try to extract username from whichever page is post-login (may be a new tab)
+            username = None
+            for p in reversed(list(all_pages)):  # newest tab first
+                username = _extract_username(p, platform)
+                if username:
+                    break
 
             try:
                 context.close()

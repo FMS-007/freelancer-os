@@ -9,8 +9,8 @@ import {
   ExternalLink, Star, FileText, Copy, CheckCheck, Globe, Users,
   ShieldCheck, CreditCard, UserCheck, BadgeCheck,
 } from 'lucide-react';
-import { aiApi } from '../lib/api';
-import { AnalyzeProjectSchema, type AnalyzeProjectInput, POPULAR_COUNTRIES, PROPOSAL_STRATEGIES } from '@freelancer-os/shared';
+import { aiApi, proposalsApi, templatesApi } from '../lib/api';
+import { AnalyzeProjectSchema, type AnalyzeProjectInput, POPULAR_COUNTRIES } from '@freelancer-os/shared';
 import type { ScrapedProject } from '@freelancer-os/shared';
 import { format, parseISO } from 'date-fns';
 import clsx from 'clsx';
@@ -26,6 +26,22 @@ interface AnalysisResult {
   bidRange: { min: number; max: number; currency: string };
   redFlags: string[];
   winningAngle: string;
+}
+
+interface InstructionOption {
+  id: string;
+  title: string;
+  content: string;
+  wordLimit: number;
+  endingText: string;
+  appendEnding: boolean;
+}
+
+type GenerationMode = 'auto' | 'instruction' | 'ai';
+
+interface GeneratedProposalMeta {
+  mode: GenerationMode;
+  usedInstruction: InstructionOption | null;
 }
 
 const EFFORT_CLASSES = {
@@ -46,14 +62,81 @@ export default function AIAnalyze() {
 
   const [result,           setResult]           = useState<AnalysisResult | null>(null);
   const [expandedId,       setExpandedId]       = useState<string | null>(null);
-  const [proposalStrategy, setProposalStrategy] = useState(PROPOSAL_STRATEGIES[0]);
   const [proposal,         setProposal]         = useState<string | null>(null);
   const [copied,           setCopied]           = useState(false);
+  const [toast,            setToast]            = useState<string | null>(null);
+  const [savedToRecords,   setSavedToRecords]   = useState(false);
+  const [generationMode,   setGenerationMode]   = useState<GenerationMode>('auto');
+  const [selectedInstructionId, setSelectedInstructionId] = useState<string>('auto');
+  const [lastGeneratedMeta, setLastGeneratedMeta] = useState<GeneratedProposalMeta | null>(null);
 
   const { data: pastAnalyses = [] } = useQuery({
     queryKey: ['ai-analyses'],
     queryFn:  aiApi.getAnalyses,
   });
+
+  const { data: templateData = [] } = useQuery({
+    queryKey: ['templates'],
+    queryFn: templatesApi.list,
+  });
+
+  const instructions: InstructionOption[] = (templateData as Array<Record<string, unknown>>)
+    .filter((t) => t.category === 'instruction')
+    .map((t) => {
+      let parsed: { wordLimit?: number; endingText?: string; appendEnding?: boolean } = {};
+      try {
+        parsed = JSON.parse(String(t.strategy || '{}')) as { wordLimit?: number; endingText?: string; appendEnding?: boolean };
+      } catch {
+        parsed = {};
+      }
+      const components = (t.components as Record<string, unknown>) || {};
+      return {
+        id: String(t.id || ''),
+        title: String(t.name || 'Instruction'),
+        content: String(components.instructionContent || ''),
+        wordLimit: typeof parsed.wordLimit === 'number' ? parsed.wordLimit : 170,
+        endingText: typeof parsed.endingText === 'string' ? parsed.endingText : 'Best regards, {Your Name}',
+        appendEnding: parsed.appendEnding !== false,
+      };
+    });
+
+  function pickBestInstruction(): InstructionOption | null {
+    if (instructions.length === 0) return null;
+
+    const text = `${watchedTitle} ${watchedDescription}`.toLowerCase();
+    const projectTokens = new Set(
+      text
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .split(/\s+/)
+        .filter((token) => token.length > 3),
+    );
+
+    let best: InstructionOption | null = null;
+    let bestScore = -1;
+
+    for (const instruction of instructions) {
+      const instructionTokens = new Set(
+        `${instruction.title} ${instruction.content}`
+          .toLowerCase()
+          .replace(/[^a-z0-9\s]/g, ' ')
+          .split(/\s+/)
+          .filter((token) => token.length > 3),
+      );
+
+      let overlap = 0;
+      for (const token of instructionTokens) {
+        if (projectTokens.has(token)) overlap += 1;
+      }
+
+      const score = overlap + Math.min(3, instruction.wordLimit / 100);
+      if (score > bestScore) {
+        bestScore = score;
+        best = instruction;
+      }
+    }
+
+    return best || instructions[0] || null;
+  }
 
   const { register, handleSubmit, setValue, watch, formState: { errors } } = useForm<AnalyzeProjectInput>({
     resolver: zodResolver(AnalyzeProjectSchema),
@@ -68,32 +151,135 @@ export default function AIAnalyze() {
       setValue('projectTitle',       prefill.title);
       setValue('projectDescription', prefill.description);
       if (prefill.clientCountry) setValue('clientCountry', prefill.clientCountry);
+      if (prefill.url)             setValue('projectUrl',      prefill.url);
+      if (prefill.paymentVerified != null) setValue('paymentVerified', prefill.paymentVerified);
+      if (prefill.identityVerified != null) setValue('emailVerified',  prefill.identityVerified);
+      if (prefill.proposalsCount  != null) setValue('proposalsCount',  prefill.proposalsCount);
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const analyzeMutation = useMutation({
     mutationFn: aiApi.analyze,
-    onSuccess:  (data) => { setResult(data); setProposal(null); },
+    onSuccess:  (data) => { setResult(data); setProposal(null); setLastGeneratedMeta(null); },
   });
 
   const proposalMutation = useMutation({
     mutationFn: aiApi.generateProposal,
-    onSuccess:  (data) => setProposal(data.proposal ?? data),
+    onSuccess:  (data) => {
+      setProposal(data.proposal ?? data);
+      setSavedToRecords(false);
+    },
+  });
+
+  const saveMutation = useMutation({
+    mutationFn: (payload: Record<string, unknown>) => proposalsApi.create(payload),
+    onSuccess: () => {
+      setSavedToRecords(true);
+      setToast('Saved to Records');
+      setTimeout(() => setToast(null), 2000);
+    },
   });
 
   function onSubmit(data: AnalyzeProjectInput) {
     setResult(null);
     setProposal(null);
+    setSavedToRecords(false);
+    setLastGeneratedMeta(null);
     analyzeMutation.mutate(data);
   }
 
   function handleGenerateProposal() {
     if (!result) return;
+
+    const chosenInstruction = generationMode === 'instruction'
+      ? (instructions.find((i) => i.id === selectedInstructionId) || null)
+      : generationMode === 'auto'
+        ? pickBestInstruction()
+        : null;
+
+    setLastGeneratedMeta({
+      mode: generationMode,
+      usedInstruction: chosenInstruction,
+    });
+
+    if (generationMode === 'instruction' && !chosenInstruction) {
+      setToast('Select an instruction first');
+      setTimeout(() => setToast(null), 2000);
+      return;
+    }
+
     proposalMutation.mutate({
       projectTitle:       watchedTitle,
       projectDescription: watchedDescription,
       analysisId:         result.id,
-      strategy:           proposalStrategy,
+      generationMode,
+      instruction: chosenInstruction
+        ? {
+            id: chosenInstruction.id,
+            title: chosenInstruction.title,
+            content: chosenInstruction.content,
+            wordLimit: chosenInstruction.wordLimit,
+            endingText: chosenInstruction.endingText,
+            appendEnding: chosenInstruction.appendEnding,
+          }
+        : undefined,
+      projectContext: {
+        budget: prefill?.budget,
+        clientCountry: String(watch('clientCountry') ?? prefill?.clientCountry ?? 'Unknown'),
+        projectUrl: String(watch('projectUrl') ?? prefill?.url ?? ''),
+        proposalsCount: Number.isFinite(watch('proposalsCount') as number) ? Number(watch('proposalsCount')) : prefill?.proposalsCount ?? undefined,
+        paymentVerified: Boolean(watch('paymentVerified')),
+        emailVerified: Boolean(watch('emailVerified')),
+        phoneVerified: Boolean(watch('phoneVerified')),
+      },
+    });
+
+    if (generationMode === 'auto' && chosenInstruction) {
+      setToast(`Auto mode selected: ${chosenInstruction.title}`);
+      setTimeout(() => setToast(null), 2000);
+    }
+  }
+
+  function handleSaveToRecords() {
+    if (!result || !proposal) return;
+
+    const chosenInstruction = lastGeneratedMeta?.usedInstruction || null;
+
+    const projectUrl = String(watch('projectUrl') ?? '').trim();
+    const clientCountry = String(watch('clientCountry') ?? prefill?.clientCountry ?? 'Unknown').trim() || 'Unknown';
+    const proposalsCount = Number.isFinite(watch('proposalsCount') as number) ? Number(watch('proposalsCount')) : undefined;
+
+    const contextLine = JSON.stringify({
+      projectUrl: projectUrl || prefill?.url || null,
+      budget: prefill?.budget || null,
+      bidCount: proposalsCount ?? prefill?.proposalsCount ?? null,
+      generationMode: lastGeneratedMeta?.mode || generationMode,
+      selectedInstruction: chosenInstruction
+        ? { id: chosenInstruction.id, title: chosenInstruction.title }
+        : {
+            id: lastGeneratedMeta?.mode === 'ai' ? 'ai-generated' : 'auto',
+            title: lastGeneratedMeta?.mode === 'ai' ? 'AI Generated' : 'Auto Select',
+          },
+      clientVerification: {
+        paymentVerified: Boolean(watch('paymentVerified')),
+        emailVerified: Boolean(watch('emailVerified')),
+        phoneVerified: Boolean(watch('phoneVerified')),
+      },
+    });
+
+    const metadataDescription = `${watchedDescription}\n\n[PROJECT_CONTEXT]${contextLine}`;
+    const bidAmount = Math.max(1, Math.round((result.bidRange.min + result.bidRange.max) / 2));
+
+    saveMutation.mutate({
+      projectTitle: watchedTitle,
+      projectDescription: metadataDescription,
+      clientCountry,
+      clientTimezone: 'UTC',
+      techStack: result.matchedSkills,
+      bidAmount,
+      currency: result.bidRange.currency || 'USD',
+      content: proposal,
+      platform: prefill?.platform || 'upwork',
     });
   }
 
@@ -101,6 +287,8 @@ export default function AIAnalyze() {
     if (!proposal) return;
     await navigator.clipboard.writeText(proposal);
     setCopied(true);
+    setToast('Copied to clipboard');
+    setTimeout(() => setToast(null), 2000);
     setTimeout(() => setCopied(false), 2000);
   }
 
@@ -113,13 +301,19 @@ export default function AIAnalyze() {
   );
 
   return (
-    <div className="p-6 max-w-5xl mx-auto">
+    <div className="page-shell">
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-dark flex items-center gap-2">
           <Brain size={24} className="text-primary" /> AI Project Analysis
         </h1>
         <p className="text-slate-500 mt-0.5">Paste any project listing and get an instant bid strategy + proposal</p>
       </div>
+
+      {toast && (
+        <div className="fixed top-4 right-4 z-50 bg-dark text-white px-4 py-2.5 rounded-xl shadow-lg text-sm font-medium pointer-events-none animate-in fade-in slide-in-from-top-2">
+          {toast}
+        </div>
+      )}
 
       {/* Project info strip — shown when navigated from Project Search / Automation */}
       {prefill && (
@@ -260,27 +454,110 @@ export default function AIAnalyze() {
               )}
             </div>
 
+
+            {/* Project URL */}
             <div>
               <label className="label">
-                Client Country <span className="text-slate-400 font-normal">(optional)</span>
+                Project URL <span className="text-slate-400 font-normal">(optional)</span>
               </label>
-              <select {...register('clientCountry')} className="input">
-                <option value="">— Unknown —</option>
-                {POPULAR_COUNTRIES.map((c) => <option key={c}>{c}</option>)}
-              </select>
+              <div className="relative">
+                <input
+                  {...register('projectUrl')}
+                  type="url"
+                  className="input pr-10"
+                  placeholder="https://www.upwork.com/jobs/..."
+                />
+                {watch('projectUrl') && (
+                  <a
+                    href={watch('projectUrl')}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-primary transition-colors"
+                    title="Open project link"
+                  >
+                    <ExternalLink size={14} />
+                  </a>
+                )}
+              </div>
             </div>
 
-            {/* Show budget from prefill as read-only info if available */}
-            {prefill?.budget && (
-              <div className="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2.5">
-                <p className="text-[11px] text-slate-400 font-medium uppercase tracking-wide mb-0.5">
-                  Project Budget
-                </p>
-                <p className="text-sm font-semibold text-dark flex items-center gap-1">
-                  <DollarSign size={13} className="text-success" /> {prefill.budget}
-                </p>
+            {/* ── Client Details ────────────────────────────────────────── */}
+            <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-3.5 space-y-3">
+              <p className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide flex items-center gap-1.5">
+                <Globe size={11} /> Client Details
+              </p>
+
+              <div>
+                <label className="label text-xs">
+                  Client Country <span className="text-slate-400 font-normal">(optional)</span>
+                </label>
+                <select {...register('clientCountry')} className="input text-sm">
+                  <option value="">— Unknown —</option>
+                  {POPULAR_COUNTRIES.map((c) => <option key={c}>{c}</option>)}
+                </select>
               </div>
-            )}
+
+              <div>
+                <label className="label text-xs">
+                  Total Proposals / Bids <span className="text-slate-400 font-normal">(optional)</span>
+                </label>
+                <input
+                  {...register('proposalsCount', { valueAsNumber: true })}
+                  type="number"
+                  min={0}
+                  className="input text-sm"
+                  placeholder="e.g. 25"
+                />
+              </div>
+
+              {/* Show budget from prefill if available */}
+              {prefill?.budget && (
+                <div className="rounded-lg bg-white border border-slate-200 px-3 py-2">
+                  <p className="text-[10px] text-slate-400 font-medium uppercase tracking-wide mb-0.5">
+                    Project Budget
+                  </p>
+                  <p className="text-sm font-semibold text-dark flex items-center gap-1">
+                    <DollarSign size={13} className="text-success" /> {prefill.budget}
+                  </p>
+                </div>
+              )}
+
+              {/* Client Verification */}
+              <div>
+                <p className="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-2">
+                  Client Verification
+                </p>
+                <div className="flex flex-col gap-2">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      {...register('paymentVerified')}
+                      className="w-3.5 h-3.5 rounded accent-primary"
+                    />
+                    <CreditCard size={12} className="text-slate-400" />
+                    <span className="text-xs text-slate-700">Payment Verified</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      {...register('emailVerified')}
+                      className="w-3.5 h-3.5 rounded accent-primary"
+                    />
+                    <UserCheck size={12} className="text-slate-400" />
+                    <span className="text-xs text-slate-700">Email / Identity Verified</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      {...register('phoneVerified')}
+                      className="w-3.5 h-3.5 rounded accent-primary"
+                    />
+                    <ShieldCheck size={12} className="text-slate-400" />
+                    <span className="text-xs text-slate-700">Phone Verified</span>
+                  </label>
+                </div>
+              </div>
+            </div>
 
             <button
               type="submit"
@@ -437,44 +714,124 @@ export default function AIAnalyze() {
                   <FileText size={12} /> Generate Proposal
                 </p>
 
+                <div className="grid grid-cols-3 gap-2">
+                  {([
+                    { value: 'auto', label: 'Auto' },
+                    { value: 'instruction', label: 'Instruction' },
+                    { value: 'ai', label: 'AI Generated' },
+                  ] as Array<{ value: GenerationMode; label: string }>).map((mode) => (
+                    <button
+                      key={mode.value}
+                      type="button"
+                      onClick={() => setGenerationMode(mode.value)}
+                      className={clsx(
+                        'rounded-xl border px-3 py-2 text-xs font-semibold transition-colors',
+                        generationMode === mode.value
+                          ? 'bg-primary text-white border-primary'
+                          : 'bg-white text-slate-600 border-slate-200 hover:border-slate-300',
+                      )}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+
+                {generationMode === 'instruction' && (
+                  <div>
+                    <label className="label text-xs">Instruction</label>
+                    <select
+                      value={selectedInstructionId}
+                      onChange={(e) => setSelectedInstructionId(e.target.value)}
+                      className="input text-sm"
+                    >
+                      <option value="">Select instruction</option>
+                      {instructions.map((instruction) => (
+                        <option key={instruction.id} value={instruction.id}>
+                          {instruction.title} ({instruction.wordLimit} words)
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {generationMode !== 'ai' && instructions.length === 0 && (
+                  <p className="text-xs text-slate-500">
+                    No saved instructions yet. Auto mode will fall back to default AI logic.
+                  </p>
+                )}
+
+                {lastGeneratedMeta?.usedInstruction && proposal && (
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-slate-500 mb-1">
+                      Applied Instruction
+                    </p>
+                    <p className="text-xs text-slate-700">
+                      {lastGeneratedMeta.usedInstruction.title} · {lastGeneratedMeta.usedInstruction.wordLimit} words
+                    </p>
+                  </div>
+                )}
+
                 <div className="flex gap-2">
-                  <select
-                    value={proposalStrategy}
-                    onChange={e => setProposalStrategy(e.target.value)}
-                    className="input text-xs flex-1"
-                  >
-                    {PROPOSAL_STRATEGIES.map(s => (
-                      <option key={s} value={s}>{s}</option>
-                    ))}
-                  </select>
                   <button
                     type="button"
                     onClick={handleGenerateProposal}
                     disabled={proposalMutation.isPending}
-                    className="btn-primary text-xs px-3 flex items-center gap-1.5 flex-shrink-0"
+                    className="btn-primary text-xs px-4 flex items-center gap-1.5 flex-1 justify-center"
                   >
                     {proposalMutation.isPending
                       ? <><RefreshCw size={12} className="animate-spin" /> Generating...</>
                       : <><Sparkles size={12} /> Generate</>}
                   </button>
+                  {proposal && (
+                    <button
+                      type="button"
+                      onClick={handleGenerateProposal}
+                      disabled={proposalMutation.isPending}
+                      className="btn-secondary text-xs px-3 flex items-center gap-1.5 flex-shrink-0"
+                    >
+                      <RefreshCw size={12} /> Regenerate
+                    </button>
+                  )}
+                  {proposal && (
+                    <button
+                      type="button"
+                      onClick={copyProposal}
+                      className="btn-secondary text-xs px-3 flex items-center gap-1.5 flex-shrink-0"
+                    >
+                      {copied
+                        ? <><CheckCheck size={12} className="text-success" /> Copied!</>
+                        : <><Copy size={12} /> Copy</>}
+                    </button>
+                  )}
+                  {proposal && (
+                    <button
+                      type="button"
+                      onClick={handleSaveToRecords}
+                      disabled={saveMutation.isPending || savedToRecords}
+                      className="btn-secondary text-xs px-3 flex items-center gap-1.5 flex-shrink-0"
+                    >
+                      {saveMutation.isPending
+                        ? <><RefreshCw size={12} className="animate-spin" /> Saving...</>
+                        : <><CheckCheck size={12} /> {savedToRecords ? 'Saved to Records' : 'Save to Records'}</>}
+                    </button>
+                  )}
                 </div>
 
                 {proposalMutation.isError && (
                   <p className="text-xs text-danger">Proposal generation failed. Try again.</p>
                 )}
 
+                {savedToRecords && (
+                  <p className="text-xs text-success">Proposal and project context saved to Records.</p>
+                )}
+
                 {proposal && (
                   <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 relative">
-                    <button
-                      type="button"
-                      onClick={copyProposal}
-                      className="absolute top-3 right-3 text-slate-400 hover:text-primary transition-colors"
-                      title="Copy proposal"
-                    >
-                      {copied
-                        ? <CheckCheck size={14} className="text-success" />
-                        : <Copy size={14} />}
-                    </button>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[10px] text-slate-400 font-medium">
+                        {proposal.length.toLocaleString()} characters · {proposal.split(/\s+/).filter(Boolean).length} words
+                      </span>
+                    </div>
                     <pre className="text-xs text-dark whitespace-pre-wrap leading-relaxed pr-6">
                       {proposal}
                     </pre>

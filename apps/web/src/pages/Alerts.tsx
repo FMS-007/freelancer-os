@@ -86,7 +86,7 @@ export default function Alerts() {
   }
 
   return (
-    <div className="p-6 max-w-4xl mx-auto">
+    <div className="page-shell-tight">
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-dark flex items-center gap-2">
           <Bell size={22} className="text-primary" /> Timezone Alerts

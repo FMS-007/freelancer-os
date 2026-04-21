@@ -23,7 +23,7 @@ router.post('/analyze', aiLimiter, validate(AnalyzeProjectSchema), async (req: A
   try {
     if (!req.userId) throw createError('Unauthorized', 401);
 
-    const { projectTitle, projectDescription, clientCountry } = req.body;
+    const { projectTitle, projectDescription, clientCountry, projectUrl, paymentVerified, emailVerified, phoneVerified, proposalsCount } = req.body;
     const safeProjectTitle = String(projectTitle ?? '').trim();
     const safeProjectDescription = String(projectDescription ?? '').trim();
     if (!safeProjectTitle || !safeProjectDescription) {
@@ -38,6 +38,7 @@ router.post('/analyze', aiLimiter, validate(AnalyzeProjectSchema), async (req: A
       profile?.skills || [],
       profile?.hourlyRate || 30,
       clientCountry || 'Unknown',
+      { projectUrl, paymentVerified, emailVerified, phoneVerified, proposalsCount },
     );
 
     let savedId: string | null = null;
@@ -104,12 +105,34 @@ const GenerateSchema = z.object({
   projectTitle: z.string().min(1),
   projectDescription: z.string().min(10),
   analysisId: z.string().optional(),
-  strategy: z.string().default('Concise Punch'),
+  generationMode: z.enum(['auto', 'instruction', 'ai']).default('auto'),
+  strategy: z.string().optional(),
+  instruction: z
+    .object({
+      id: z.string().optional(),
+      title: z.string().min(1),
+      content: z.string().min(1),
+      wordLimit: z.number().int().positive().optional(),
+      endingText: z.string().optional(),
+      appendEnding: z.boolean().optional(),
+    })
+    .optional(),
+  projectContext: z
+    .object({
+      budget: z.string().optional(),
+      clientCountry: z.string().optional(),
+      projectUrl: z.string().optional(),
+      proposalsCount: z.number().int().nonnegative().optional(),
+      paymentVerified: z.boolean().optional(),
+      emailVerified: z.boolean().optional(),
+      phoneVerified: z.boolean().optional(),
+    })
+    .optional(),
 });
 
 router.post('/generate-proposal', aiLimiter, validate(GenerateSchema), async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    const { projectTitle, projectDescription, analysisId, strategy } = req.body;
+    const { projectTitle, projectDescription, analysisId, generationMode, strategy, instruction, projectContext } = req.body;
 
     const [profile, user] = await Promise.all([
       prisma.userProfile.findUnique({ where: { userId: req.userId } }),
@@ -150,6 +173,9 @@ router.post('/generate-proposal', aiLimiter, validate(GenerateSchema), async (re
       user?.name || 'Freelancer',
       profile?.bio || '',
       strategy,
+      instruction,
+      generationMode,
+      projectContext,
     );
 
     res.json({ proposal, analysis });

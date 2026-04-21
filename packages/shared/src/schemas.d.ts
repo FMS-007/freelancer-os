@@ -117,18 +117,33 @@ export declare const ProposalStatusSchema: z.ZodObject<{
 export declare const AnalyzeProjectSchema: z.ZodObject<{
     projectTitle: z.ZodString;
     projectDescription: z.ZodString;
+    projectUrl: z.ZodOptional<z.ZodString>;
     clientCountry: z.ZodOptional<z.ZodString>;
     clientTimezone: z.ZodOptional<z.ZodString>;
+    paymentVerified: z.ZodOptional<z.ZodBoolean>;
+    emailVerified: z.ZodOptional<z.ZodBoolean>;
+    phoneVerified: z.ZodOptional<z.ZodBoolean>;
+    proposalsCount: z.ZodOptional<z.ZodNumber>;
 }, "strip", z.ZodTypeAny, {
     projectTitle: string;
     projectDescription: string;
     clientCountry?: string | undefined;
     clientTimezone?: string | undefined;
+    projectUrl?: string | undefined;
+    paymentVerified?: boolean | undefined;
+    emailVerified?: boolean | undefined;
+    phoneVerified?: boolean | undefined;
+    proposalsCount?: number | undefined;
 }, {
     projectTitle: string;
     projectDescription: string;
     clientCountry?: string | undefined;
     clientTimezone?: string | undefined;
+    projectUrl?: string | undefined;
+    paymentVerified?: boolean | undefined;
+    emailVerified?: boolean | undefined;
+    phoneVerified?: boolean | undefined;
+    proposalsCount?: number | undefined;
 }>;
 export declare const AlertConfigSchema: z.ZodObject<{
     countries: z.ZodArray<z.ZodString, "many">;

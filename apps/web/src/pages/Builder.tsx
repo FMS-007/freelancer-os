@@ -68,7 +68,7 @@ export default function Builder() {
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto">
+    <div className="page-shell">
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-dark">Proposal Builder</h1>
         <p className="text-slate-500 mt-0.5">Assemble from saved components or generate with AI</p>

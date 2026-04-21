@@ -1,13 +1,34 @@
 import { Router, Response, NextFunction } from 'express';
 import prisma from '../lib/prisma';
+import { redis } from '../lib/redis';
 import { UserProfileSchema } from '@freelancer-os/shared';
 import { authenticate, AuthRequest } from '../middleware/auth';
 import { validate } from '../middleware/validate';
 import { createError } from '../middleware/errorHandler';
 import bcrypt from 'bcryptjs';
+import multer from 'multer';
+import fs from 'fs/promises';
+import path from 'path';
 
 const router: Router = Router();
 router.use(authenticate);
+
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+});
+
+const avatarDir = path.resolve(process.cwd(), 'uploads', 'avatars');
+
+function avatarExtension(mimeType: string, originalName: string): string {
+  const ext = path.extname(originalName).toLowerCase();
+  if (ext === '.jpg' || ext === '.jpeg' || ext === '.png' || ext === '.webp' || ext === '.gif') return ext;
+  if (mimeType === 'image/jpeg') return '.jpg';
+  if (mimeType === 'image/png') return '.png';
+  if (mimeType === 'image/webp') return '.webp';
+  if (mimeType === 'image/gif') return '.gif';
+  return '.png';
+}
 
 // GET /api/v1/users/profile
 router.get('/profile', async (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -58,6 +79,35 @@ router.put('/profile', validate(UserProfileSchema), async (req: AuthRequest, res
         create: { userId: req.userId!, skills: [], platforms: [], ...profileUpdate },
       });
     }
+
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/users/me/avatar
+router.post('/me/avatar', avatarUpload.single('avatar'), async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    if (!req.userId) throw createError('Unauthorized', 401);
+    const file = (req as AuthRequest & { file?: Express.Multer.File }).file;
+    if (!file) throw createError('Avatar image is required', 400);
+    if (!file.mimetype.startsWith('image/')) throw createError('Avatar must be an image', 400);
+
+    const existingUser = await prisma.user.findUnique({ where: { id: req.userId } });
+    if (!existingUser) throw createError('User not found', 404);
+
+    await fs.mkdir(avatarDir, { recursive: true });
+    const ext = avatarExtension(file.mimetype, file.originalname);
+    const filename = `avatar-${req.userId}-${Date.now()}${ext}`;
+    await fs.writeFile(path.join(avatarDir, filename), file.buffer);
+
+    const avatarUrl = `/uploads/avatars/${filename}`;
+    const user = await prisma.user.update({
+      where: { id: req.userId },
+      data: { avatarUrl },
+      select: { id: true, email: true, name: true, timezone: true, avatarUrl: true, createdAt: true },
+    });
 
     res.json(user);
   } catch (err) {
@@ -123,12 +173,31 @@ router.put('/password', async (req: AuthRequest, res: Response, next: NextFuncti
   }
 });
 
+async function deleteCurrentUser(req: AuthRequest) {
+  if (!req.userId) throw createError('Unauthorized', 401);
+
+  const existingUser = await prisma.user.findUnique({ where: { id: req.userId } });
+  if (!existingUser) throw createError('User not found', 404);
+
+  await redis.del(`refresh:${req.userId}`);
+  await prisma.user.delete({ where: { id: req.userId } });
+}
+
+// DELETE /api/v1/users/me
+router.delete('/me', async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    await deleteCurrentUser(req);
+    res.json({ success: true, message: 'Account deleted' });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // DELETE /api/v1/users/account
 router.delete('/account', async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {
-    // Delete user and cascade (Prisma will respect onDelete: Cascade set in schema)
-    await prisma.user.delete({ where: { id: req.userId } });
-    res.json({ message: 'Account deleted' });
+    await deleteCurrentUser(req);
+    res.json({ success: true, message: 'Account deleted' });
   } catch (err) {
     next(err);
   }

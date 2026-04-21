@@ -14,6 +14,37 @@ const STATUS_LABELS: Record<string, string> = {
   no_response: 'No Response',
 };
 
+type ProjectContextMeta = {
+  projectUrl?: string | null;
+  budget?: string | null;
+  bidCount?: number | null;
+  generationMode?: 'auto' | 'instruction' | 'ai' | null;
+  selectedInstruction?: {
+    id?: string;
+    title?: string;
+  } | null;
+  clientVerification?: {
+    paymentVerified?: boolean;
+    emailVerified?: boolean;
+    phoneVerified?: boolean;
+  };
+};
+
+function extractContext(description: string): { plainDescription: string; meta: ProjectContextMeta | null } {
+  const marker = '[PROJECT_CONTEXT]';
+  const idx = description.lastIndexOf(marker);
+  if (idx === -1) return { plainDescription: description, meta: null };
+
+  const plainDescription = description.slice(0, idx).trimEnd();
+  const jsonPart = description.slice(idx + marker.length).trim();
+
+  try {
+    return { plainDescription, meta: JSON.parse(jsonPart) as ProjectContextMeta };
+  } catch {
+    return { plainDescription: description, meta: null };
+  }
+}
+
 export default function Records() {
   const qc = useQueryClient();
   const [statusFilter, setStatusFilter] = useState('');
@@ -37,7 +68,7 @@ export default function Records() {
     },
   });
 
-  const proposals: Proposal[] = data?.proposals ?? [];
+  const proposals: Proposal[] = data?.records ?? data?.proposals ?? [];
 
   function handleExportCsv() {
     recordsApi.exportCsv().then((res) => {
@@ -50,11 +81,11 @@ export default function Records() {
   }
 
   return (
-    <div className="p-6 max-w-7xl mx-auto">
+    <div className="page-shell">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h1 className="text-2xl font-bold text-dark">Proposal Records</h1>
-          <p className="text-slate-500 mt-0.5">All proposals — records expire after 7 days</p>
+          <h1 className="text-2xl font-bold text-dark">Records</h1>
+          <p className="text-slate-500 mt-0.5">Unified proposal history and project context database</p>
         </div>
         <button onClick={handleExportCsv} className="btn-secondary text-xs px-3 py-2">
           <Download size={14} /> Export CSV
@@ -65,10 +96,10 @@ export default function Records() {
       {stats && (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
           {[
-            { label: 'Total', value: stats.totalProposals, color: 'text-dark' },
-            { label: 'Won', value: stats.wonProposals, color: 'text-success' },
+            { label: 'Total', value: stats.total ?? stats.totalProposals ?? 0, color: 'text-dark' },
+            { label: 'Won', value: stats.won ?? stats.wonProposals ?? 0, color: 'text-success' },
             { label: 'Win Rate', value: `${stats.winRate}%`, color: 'text-primary' },
-            { label: 'Avg Bid', value: `$${stats.avgBidAmount}`, color: 'text-warning' },
+            { label: 'Pending', value: stats.pending ?? 0, color: 'text-warning' },
           ].map(({ label, value, color }) => (
             <div key={label} className="card p-4">
               <p className={clsx('text-2xl font-bold', color)}>{value}</p>
@@ -104,7 +135,7 @@ export default function Records() {
           <table className="w-full">
             <thead className="border-b border-slate-100 bg-slate-50">
               <tr>
-                {['Project', 'Platform', 'Country', 'Bid', 'Status', 'Submitted'].map((h) => (
+                {['Project', 'Platform', 'Country', 'Budget', 'Bids', 'Mode', 'Instruction', 'Client Details', 'Bid', 'Status', 'Submitted'].map((h) => (
                   <th key={h} className="text-left px-4 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wide">
                     {h}
                   </th>
@@ -112,10 +143,16 @@ export default function Records() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {proposals.map((p) => (
+              {proposals.map((p) => {
+                const { plainDescription, meta } = extractContext(p.projectDescription || '');
+
+                return (
                 <tr key={p.id} className="hover:bg-slate-50 transition-colors">
                   <td className="px-4 py-3 max-w-xs">
                     <p className="font-medium text-dark text-sm truncate">{p.projectTitle}</p>
+                    {plainDescription && (
+                      <p className="text-xs text-slate-500 mt-0.5 line-clamp-2">{plainDescription}</p>
+                    )}
                     {p.techStack?.length > 0 && (
                       <div className="flex gap-1 mt-1 flex-wrap">
                         {p.techStack.slice(0, 3).map((t) => (
@@ -131,6 +168,30 @@ export default function Records() {
                     <span className="badge badge-blue capitalize">{p.platform}</span>
                   </td>
                   <td className="px-4 py-3 text-sm text-slate-600">{p.clientCountry}</td>
+                  <td className="px-4 py-3 text-xs text-slate-600">{meta?.budget || '-'}</td>
+                  <td className="px-4 py-3 text-xs text-slate-600">{meta?.bidCount ?? '-'}</td>
+                  <td className="px-4 py-3 text-xs text-slate-600 capitalize">{meta?.generationMode || 'auto'}</td>
+                  <td className="px-4 py-3 text-xs text-slate-600">
+                    {meta?.selectedInstruction?.title || 'Auto Select'}
+                  </td>
+                  <td className="px-4 py-3 text-xs text-slate-600">
+                    <div className="flex flex-col gap-0.5">
+                      <span>
+                        Payment: {meta?.clientVerification?.paymentVerified ? 'Yes' : 'No'}
+                      </span>
+                      <span>
+                        Email: {meta?.clientVerification?.emailVerified ? 'Yes' : 'No'}
+                      </span>
+                      <span>
+                        Phone: {meta?.clientVerification?.phoneVerified ? 'Yes' : 'No'}
+                      </span>
+                      {meta?.projectUrl && (
+                        <a className="text-primary hover:underline truncate" href={meta.projectUrl} target="_blank" rel="noopener noreferrer">
+                          Project Link
+                        </a>
+                      )}
+                    </div>
+                  </td>
                   <td className="px-4 py-3 text-sm font-medium text-dark">
                     ${p.bidAmount} <span className="text-slate-400 font-normal">{p.currency}</span>
                   </td>
@@ -158,7 +219,7 @@ export default function Records() {
                     {format(parseISO(p.createdAt), 'MMM d, yyyy')}
                   </td>
                 </tr>
-              ))}
+              );})}
             </tbody>
           </table>
         )}
