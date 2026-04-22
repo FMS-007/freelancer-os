@@ -50,6 +50,17 @@
         "http://localhost:3000/*",
         "https://*/*"
       ],
+      "js": ["content-scripts/app-bridge-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "http://localhost:5173/*",
+        "http://localhost:3000/*",
+        "https://*/*"
+      ],
       "js": ["content-scripts/app-bridge.js"],
       "run_at": "document_start",
       "all_frames": false

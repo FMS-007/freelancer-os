@@ -446,6 +446,21 @@ router.post('/auto-results', authenticate, async (req: AuthRequest, res: Respons
   }
 });
 
+// DELETE /api/v1/scraper/clear-results — clears Redis auto-projects + log for the user
+router.delete('/clear-results', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const userId = req.userId!;
+    const { redis } = await import('../lib/redis');
+    await Promise.allSettled([
+      redis.del(`auto-projects:${userId}`),
+      redis.del(`auto-log:${userId}`),
+    ]);
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // GET /api/v1/scraper/auto-results — Automation page polls for extension auto-scrape results
 router.get('/auto-results', authenticate, async (req: AuthRequest, res: Response, next: NextFunction) => {
   try {

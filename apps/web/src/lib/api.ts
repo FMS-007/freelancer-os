@@ -220,6 +220,9 @@ export const scraperApi = {
   /** Get extension auto-scrape run log + projects for Automation page. */
   getAutoResults: () =>
     api.get('/scraper/auto-results').then(r => r.data),
+  /** Clear Redis auto-results cache for the current user (called by Clear All). */
+  clearResults: () =>
+    api.delete('/scraper/clear-results').then(r => r.data),
 };
 
 // ── Platform Connections (OAuth) ──────────────────────────────────────────────

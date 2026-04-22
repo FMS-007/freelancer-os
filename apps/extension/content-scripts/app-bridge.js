@@ -12,23 +12,12 @@
 'use strict';
 
 // ── Signal presence to the web page ──────────────────────────────────────────
-// Scraper.tsx checks window.__FOS_EXTENSION_INSTALLED__ to know the extension exists.
-// We set it on `window` but content scripts have their own JS context, so we use
-// a custom element in the document as the cross-context signal.
-
+// window.__FOS_EXTENSION_INSTALLED__ is set by app-bridge-main.js (world:"MAIN").
+// This meta element provides a CSP-safe DOM signal as a secondary check.
 const marker = document.createElement('meta');
 marker.setAttribute('name', 'fos-extension-installed');
 marker.setAttribute('content', chrome.runtime.id);
 (document.head || document.documentElement).appendChild(marker);
-
-// Also inject a tiny inline script to set the global on the page's window
-const injectScript = document.createElement('script');
-injectScript.textContent = `
-  window.__FOS_EXTENSION_INSTALLED__ = true;
-  window.__FOS_EXTENSION_ID__ = "${chrome.runtime.id}";
-`;
-(document.head || document.documentElement).appendChild(injectScript);
-injectScript.remove(); // Clean up after execution
 
 // ── Web page → Extension ──────────────────────────────────────────────────────
 // Listen for scrape requests dispatched by the web app's React code.

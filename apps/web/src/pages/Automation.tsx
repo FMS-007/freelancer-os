@@ -193,12 +193,11 @@ export default function Automation() {
     loadStorage<AutomationConfig>('fos_autoConfig', DEFAULT_CONFIG),
   );
 
-  // Runtime state
+  // Runtime state — matchedProjects intentionally NOT loaded from storage.
+  // Starting fresh each page open ensures scraping-OFF means empty results.
   const [enabled,         setEnabled]         = useState(false);
   const [running,         setRunning]          = useState(false);
-  const [matchedProjects, setMatchedProjects]  = useState<ScrapedProject[]>(() =>
-    loadStorage<ScrapedProject[]>('fos_autoMatched', []),
-  );
+  const [matchedProjects, setMatchedProjects]  = useState<ScrapedProject[]>([]);
 
   // Saved projects — shared localStorage key with Project Search
   const [savedProjects, setSavedProjects] = useState<ScrapedProject[]>(() =>
@@ -241,47 +240,10 @@ export default function Automation() {
 
   // Extension event listener wired up after addLog is defined (see below)
 
-  // Load saved projects from DB on mount (syncs across sessions)
-  useEffect(() => {
-    scraperApi.getSaved()
-      .then(data => {
-        if (!Array.isArray(data.records)) return;
-        setSavedProjects(prev => {
-          const existingIds = new Set(prev.map((p: ScrapedProject) => p.id));
-          const fromDb: ScrapedProject[] = data.records
-            .filter((r: { id: string }) => !existingIds.has(r.id))
-            .map((r: {
-              id: string; title: string; description: string;
-              url: string | null; platform: string; techStack: string[];
-              clientCountry: string; scrapedAt: string;
-            }) => ({
-              id:            r.id,
-              title:         r.title,
-              description:   r.description,
-              budget:        '',
-              skills:        r.techStack ?? [],
-              clientCountry: r.clientCountry ?? '',
-              clientRating:  null,
-              postedAt:      r.scrapedAt ?? '',
-              url:           r.url ?? '',
-              platform:      (r.platform ?? 'upwork') as 'upwork' | 'freelancer',
-              proposalsCount: null,
-            }));
-          return fromDb.length > 0 ? [...fromDb, ...prev] : prev;
-        });
-      })
-      .catch(() => { /* offline / not authenticated — localStorage is fine */ });
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
   // Persist config
   useEffect(() => {
     localStorage.setItem('fos_autoConfig', JSON.stringify(config));
   }, [config]);
-
-  // Persist matched projects
-  useEffect(() => {
-    localStorage.setItem('fos_autoMatched', JSON.stringify(matchedProjects));
-  }, [matchedProjects]);
 
   // Persist saved projects (shared with Project Search)
   useEffect(() => {
@@ -312,10 +274,12 @@ export default function Automation() {
 
   // ── Extension auto-results polling ────────────────────────────────────────────
 
+  // Only poll when automation is enabled — no data fetching when stopped/idle.
   const { data: autoResultsData } = useQuery({
     queryKey: ['automation-auto-results'],
     queryFn: scraperApi.getAutoResults,
-    refetchInterval: 10000,
+    enabled: enabled,
+    refetchInterval: enabled ? 10000 : false,
     staleTime: 0,
   });
 
@@ -324,12 +288,15 @@ export default function Automation() {
 
     if (Array.isArray(autoResultsData.logs)) {
       const newEntries: RunLog[] = [];
-      for (const l of autoResultsData.logs as Array<{ ts: string; platform: string; query: string; count: number }>) {
+      for (const l of autoResultsData.logs as Array<{ ts: string; platform: string; query: string; received?: number; fresh?: number; count?: number }>) {
         if (seenAutoTsRef.current.has(l.ts)) continue;
         seenAutoTsRef.current.add(l.ts);
+        const matched = l.fresh ?? l.count ?? 0;
+        const total   = l.received ?? matched;
+        const detail  = total > matched ? `${matched} matched (${total} scraped)` : `${matched} project(s)`;
         newEntries.push({
           ts: fmt(new Date(l.ts)),
-          message: `[Extension auto-scrape] ${l.count} project(s) for "${l.query}" on ${l.platform}`,
+          message: `[Extension auto-scrape] ${detail} for "${l.query}" on ${l.platform}`,
           type: 'success',
         });
       }
@@ -594,6 +561,8 @@ export default function Automation() {
     setMatchedProjects([]);
     setMatchedPage(1);
     addLog('Matched projects cleared', 'info');
+    // Clear Redis cache so data doesn't reappear on next poll
+    scraperApi.clearResults().catch(() => {});
   }
 
   // ── Derived state ─────────────────────────────────────────────────────────────
