@@ -340,7 +340,7 @@ btnSaveConnect.addEventListener('click', async () => {
     setApiStatus(false, 'Network error — check API URL');
   } finally {
     btnSaveConnect.disabled    = false;
-    btnSaveConnect.textContent = '💾 Save & Test';
+    btnSaveConnect.textContent = 'Save & Test Connection';
   }
 });
 
@@ -482,7 +482,7 @@ btnScrape.addEventListener('click', async () => {
 
   await chrome.storage.local.set({ lastPlatform: platform });
   btnScrape.disabled    = true;
-  btnScrape.textContent = '⏳ Scraping...';
+  btnScrape.textContent = 'Scraping...';
 
   chrome.runtime.sendMessage({ type: 'SCRAPE', query, platform, apiUrl, authToken, filters: scrapeFilters });
 });
@@ -538,7 +538,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     }
 
     btnScrape.disabled    = false;
-    btnScrape.textContent = '🔍 Start Scraping';
+    btnScrape.textContent = 'Start Scraping';
 
     if (msg.error) {
       scrapeStatusText.textContent = `Error: ${msg.error}`;

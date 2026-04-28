@@ -1,42 +1,55 @@
 /**
  * Freelancer OS Connector — App Bridge Content Script
  *
- * Injected into the Freelancer OS web app pages. Creates a two-way bridge
- * between the web page and the extension background service worker using
- * custom DOM events. The web app never needs to know the extension's ID.
+ * Two-way bridge between the Freelancer OS web app and the extension background
+ * service worker. Communicates via custom DOM events (page ↔ bridge) and
+ * chrome.runtime messages (bridge ↔ background).
  *
- * Web page  →  (CustomEvent FOS_SCRAPE_REQUEST)  →  bridge  →  background.js
- * background.js  →  (chrome.runtime.onMessage)  →  bridge  →  (CustomEvent FOS_SCRAPE_EVENT)  →  web page
+ * Events the web page can dispatch:
+ *   FOS_SCRAPE_REQUEST   — trigger a manual scrape
+ *   FOS_AUTO_SCRAPE      — enable/disable auto-scrape alarm
+ *   FOS_GET_EXT_STATE    — request current extension state snapshot
+ *   FOS_SET_EXT_STATE    — push config changes into extension storage
+ *
+ * Events the web page receives:
+ *   FOS_SCRAPE_RESPONSE      — ack for FOS_SCRAPE_REQUEST
+ *   FOS_SCRAPE_EVENT         — SCRAPE_STATUS / SCRAPE_DONE forwarded from background
+ *   FOS_EXT_STATE            — response to FOS_GET_EXT_STATE
+ *   FOS_EXT_STATE_CHANGED    — fired whenever relevant storage keys change
  */
 
 'use strict';
 
 // ── Signal presence to the web page ──────────────────────────────────────────
-// window.__FOS_EXTENSION_INSTALLED__ is set by app-bridge-main.js (world:"MAIN").
-// This meta element provides a CSP-safe DOM signal as a secondary check.
+// window.__FOS_EXTENSION_INSTALLED__ is set by app-bridge-main.js (MAIN world).
+// The meta tag is a CSP-safe secondary check for the isolated world.
 const marker = document.createElement('meta');
 marker.setAttribute('name', 'fos-extension-installed');
 marker.setAttribute('content', chrome.runtime.id);
 (document.head || document.documentElement).appendChild(marker);
 
-// ── Web page → Extension ──────────────────────────────────────────────────────
-// Listen for scrape requests dispatched by the web app's React code.
+// ── Storage keys that the web app cares about ─────────────────────────────────
+const STATE_KEYS = [
+  'autoScrape', 'selectedKeywords', 'lastPlatform',
+  'scrapeFilters', 'scheduleInterval', 'scheduleDays',
+  'scheduleStartHour', 'scheduleEndHour',
+  'scrapeStatus', 'lastScrapeTime', 'lastScrapeCount', 'lastScrapedTotal',
+];
+
+// ── Web page → Extension: manual scrape ──────────────────────────────────────
 window.addEventListener('FOS_SCRAPE_REQUEST', (event) => {
   const detail = event.detail || {};
   chrome.runtime.sendMessage({
     type:     'SCRAPE',
     query:    detail.query    || '',
     platform: detail.platform || 'both',
-    // apiUrl and authToken are NOT passed from the page — background.js reads
-    // them from chrome.storage.local (stored there by popup.js). This keeps
-    // sensitive tokens off the page DOM.
   }, (response) => {
-    if (chrome.runtime.lastError) return; // Extension not ready
+    if (chrome.runtime.lastError) return;
     window.dispatchEvent(new CustomEvent('FOS_SCRAPE_RESPONSE', { detail: response }));
   });
 });
 
-// Also support direct AUTO_SCRAPE toggle from the page
+// ── Web page → Extension: toggle auto-scrape alarm ───────────────────────────
 window.addEventListener('FOS_AUTO_SCRAPE', (event) => {
   const detail = event.detail || {};
   chrome.runtime.sendMessage({
@@ -44,13 +57,53 @@ window.addEventListener('FOS_AUTO_SCRAPE', (event) => {
   }).catch(() => {});
 });
 
-// ── Extension → Web page ──────────────────────────────────────────────────────
-// Forward all SCRAPE_STATUS and SCRAPE_DONE messages from background.js to
-// the web page as custom DOM events that React can listen to.
+// ── Web page → Extension: request full state snapshot ────────────────────────
+window.addEventListener('FOS_GET_EXT_STATE', () => {
+  chrome.storage.local.get(STATE_KEYS, (state) => {
+    window.dispatchEvent(new CustomEvent('FOS_EXT_STATE', { detail: state || {} }));
+  });
+});
+
+// ── Web page → Extension: push config changes ────────────────────────────────
+// The Automation page writes here when the user changes settings so both the
+// extension popup and the background alarm stay in sync.
+window.addEventListener('FOS_SET_EXT_STATE', (event) => {
+  const updates = event.detail || {};
+  if (!updates || Object.keys(updates).length === 0) return;
+
+  chrome.storage.local.set(updates, () => {
+    if (chrome.runtime.lastError) return;
+
+    if ('autoScrape' in updates) {
+      // Toggle the background alarm
+      const type = updates.autoScrape ? 'AUTO_SCRAPE_ON' : 'AUTO_SCRAPE_OFF';
+      chrome.runtime.sendMessage({ type }).catch(() => {});
+    } else if ('scheduleInterval' in updates) {
+      // Restart alarm with the new interval when it is already running
+      chrome.runtime.sendMessage({ type: 'RESCHEDULE_IF_ACTIVE' }).catch(() => {});
+    }
+  });
+});
+
+// ── Extension → Web page: forward scrape progress messages ───────────────────
 chrome.runtime.onMessage.addListener((msg) => {
   if (msg.type === 'SCRAPE_STATUS' || msg.type === 'SCRAPE_DONE') {
     window.dispatchEvent(new CustomEvent('FOS_SCRAPE_EVENT', { detail: msg }));
   }
-  // Return false = no async response needed
   return false;
+});
+
+// ── Extension storage → Web page: broadcast relevant changes ─────────────────
+// Fires FOS_EXT_STATE_CHANGED whenever the extension popup (or background) writes
+// to any of the tracked storage keys so the Automation page can react instantly.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  const hasRelevant = STATE_KEYS.some(k => k in changes);
+  if (!hasRelevant) return;
+
+  const delta = {};
+  for (const key of STATE_KEYS) {
+    if (key in changes) delta[key] = changes[key].newValue;
+  }
+  window.dispatchEvent(new CustomEvent('FOS_EXT_STATE_CHANGED', { detail: delta }));
 });

@@ -1,30 +1,28 @@
 /**
  * Automation page
  *
- * Two modes:
- *   1. Test Now  — runs one immediate cycle regardless of time window
- *   2. Automation ON — runs on a configurable interval, respects start/end time window
+ * The browser extension is the single source of truth for all automation state:
+ * keywords, platform, schedule, filters, and whether automation is running.
  *
- * Each cycle:
- *   1. Calls scraperApi.search with the configured query / platform / limit.
- *   2. Applies all client-side match filters (tech stack, keywords, budget,
- *      rating, review count, verification flags).
- *   3. Deduplicates and appends matched projects to the Matched list.
- *   4. Auto-saves every newly matched project via scraperApi.saveProject (DB)
- *      and mirrors it into the shared localStorage key used by Project Search.
+ * When the extension is installed:
+ *   - Config is loaded from extension storage on mount via FOS_GET_EXT_STATE.
+ *   - FOS_EXT_STATE_CHANGED keeps the page in sync when the popup changes settings.
+ *   - The extension's alarm drives timing; the web-page scheduler is suppressed.
+ *   - Projects accumulate in the backend via POST /scraper/auto-results and are
+ *     fetched here by GET /scraper/auto-results polling (every 10 s).
  *
- * Config + matched projects are persisted to localStorage so they survive
- * page refreshes (the automation interval itself must be re-enabled after reload).
+ * Without the extension, the page runs its own interval-based scheduler that
+ * calls the Python scraper or cached extension results directly.
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import {
   Bot, Play, Square, FlaskConical, CheckCircle2, AlertCircle, Clock,
   SlidersHorizontal, ExternalLink, DollarSign, Globe, Users, Brain,
   Bookmark, BookmarkCheck, X, ChevronDown, ChevronUp, ChevronLeft, ChevronRight, RefreshCw,
-  Link2, Zap, Star, Puzzle,
+  Link2, Zap, Star, Puzzle, Calendar,
 } from 'lucide-react';
 import { scraperApi } from '../lib/api';
 import type { ScrapedProject } from '@freelancer-os/shared';
@@ -38,8 +36,9 @@ interface AutomationConfig {
   platform:         'both' | 'upwork' | 'freelancer';
   intervalMinutes:  number;
   fetchLimit:       number;
-  startTime:        string;  // "HH:MM"
-  endTime:          string;  // "HH:MM"
+  startTime:        string;   // "HH:MM"
+  endTime:          string;   // "HH:MM"
+  activeDays:       number[]; // 0=Sun … 6=Sat
   techStack:        string[];
   maxProposals:     string;
   minClientRating:  string;
@@ -60,6 +59,26 @@ interface RunLog {
   type:    'info' | 'success' | 'warn' | 'error';
 }
 
+// Extension storage shape (subset we care about)
+interface ExtState {
+  autoScrape?:       boolean;
+  selectedKeywords?: string[];
+  lastPlatform?:     string;
+  scrapeFilters?:    {
+    paymentVerified?: boolean;
+    profileVerified?: boolean;
+    depositMade?:     boolean;
+    minReviews?:      number;
+    minRating?:       number;
+  };
+  scheduleInterval?:  number;
+  scheduleDays?:      number[];
+  scheduleStartHour?: number;
+  scheduleEndHour?:   number;
+  lastScrapeTime?:    number;
+  lastScrapeCount?:   number;
+}
+
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: AutomationConfig = {
@@ -69,6 +88,7 @@ const DEFAULT_CONFIG: AutomationConfig = {
   fetchLimit:       30,
   startTime:        '05:00',
   endTime:          '17:00',
+  activeDays:       [1, 2, 3, 4, 5],
   techStack:        [],
   maxProposals:     'any',
   minClientRating:  '',
@@ -91,6 +111,7 @@ const INTERVALS = [
   { label: 'Every 1 hr',   value: 60 },
 ];
 
+const DAY_LABELS = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
 const AUTO_PAGE_SIZE = 12;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -115,52 +136,103 @@ function isWithinWindow(start: string, end: string): boolean {
   const s   = timeToMinutes(start);
   const e   = timeToMinutes(end);
   if (s <= e) return cur >= s && cur <= e;
-  return cur >= s || cur <= e; // overnight window
+  return cur >= s || cur <= e;
+}
+
+function hourToTime(hour: number): string {
+  return `${String(hour).padStart(2, '0')}:00`;
+}
+
+function timeToHour(time: string): number {
+  return parseInt(time.split(':')[0], 10) || 0;
+}
+
+/** Convert extension storage state into Automation page config fields. */
+function extStateToConfigPatch(state: ExtState): Partial<AutomationConfig> {
+  const patch: Partial<AutomationConfig> = {};
+  if (Array.isArray(state.selectedKeywords) && state.selectedKeywords.length > 0) {
+    patch.query = state.selectedKeywords.join(', ');
+  }
+  if (state.lastPlatform && ['both', 'upwork', 'freelancer'].includes(state.lastPlatform)) {
+    patch.platform = state.lastPlatform as AutomationConfig['platform'];
+  }
+  if (typeof state.scheduleInterval === 'number') {
+    patch.intervalMinutes = state.scheduleInterval;
+  }
+  if (typeof state.scheduleStartHour === 'number') {
+    patch.startTime = hourToTime(state.scheduleStartHour);
+  }
+  if (typeof state.scheduleEndHour === 'number') {
+    patch.endTime = hourToTime(state.scheduleEndHour);
+  }
+  if (Array.isArray(state.scheduleDays)) {
+    patch.activeDays = state.scheduleDays;
+  }
+  if (state.scrapeFilters) {
+    const f = state.scrapeFilters;
+    if (f.paymentVerified !== undefined) patch.paymentVerified  = f.paymentVerified;
+    if (f.profileVerified !== undefined) patch.identityVerified = f.profileVerified;
+    if (f.depositMade     !== undefined) patch.depositMade      = f.depositMade;
+    if (typeof f.minReviews === 'number') patch.minClientReviews = f.minReviews > 0 ? String(f.minReviews) : '';
+    if (typeof f.minRating  === 'number') patch.minClientRating  = f.minRating  > 0 ? String(f.minRating)  : '';
+  }
+  return patch;
+}
+
+/** Convert Automation page config back into extension storage shape. */
+function configToExtState(config: AutomationConfig): Record<string, unknown> {
+  return {
+    selectedKeywords: config.query.split(',').map(k => k.trim()).filter(Boolean),
+    lastQuery:        config.query,
+    lastPlatform:     config.platform,
+    scheduleInterval: config.intervalMinutes,
+    scheduleStartHour: timeToHour(config.startTime),
+    scheduleEndHour:   timeToHour(config.endTime),
+    scheduleDays:      config.activeDays,
+    scrapeFilters: {
+      paymentVerified: config.paymentVerified,
+      profileVerified: config.identityVerified,
+      depositMade:     config.depositMade,
+      minReviews: config.minClientReviews ? parseInt(config.minClientReviews, 10) || 0 : 0,
+      minRating:  config.minClientRating  ? parseFloat(config.minClientRating)  || 0 : 0,
+    },
+  };
 }
 
 function matchesConfig(project: ScrapedProject, cfg: AutomationConfig): boolean {
-  // Max proposals
   if (cfg.maxProposals !== 'any') {
     const max = parseInt(cfg.maxProposals, 10);
     if ((project.proposalsCount ?? 999) > max) return false;
   }
-
-  // Min client rating
   if (cfg.minClientRating) {
     const min = parseFloat(cfg.minClientRating);
-    if ((project.clientRating ?? 0) < min) return false;
+    if (project.clientRating != null && project.clientRating < min) return false;
   }
-
-  // Min client review count
   if (cfg.minClientReviews) {
     const min = parseInt(cfg.minClientReviews, 10);
     if (!isNaN(min) && project.clientReviewCount != null && project.clientReviewCount < min) return false;
   }
-
-  // Include keywords (title + description)
   const text = (project.title + ' ' + project.description).toLowerCase();
   if (cfg.includeKeywords.trim()) {
     const kws = cfg.includeKeywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
     if (!kws.every(k => text.includes(k))) return false;
   }
-
-  // Exclude keywords
   if (cfg.excludeKeywords.trim()) {
     const kws = cfg.excludeKeywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
     if (kws.some(k => text.includes(k))) return false;
   }
-
-  // Tech stack (project skills OR title/desc contains any selected item)
   if (cfg.techStack.length > 0) {
     const skillSet = (project.skills ?? []).map(s => s.toLowerCase());
+    // Normalize: strip dots/spaces so "node.js" matches "nodejs", "Node JS", etc.
+    const norm = (s: string) => s.toLowerCase().replace(/[.\s]/g, '');
     const hasStack = cfg.techStack.some(t => {
-      const tl = t.toLowerCase();
-      return skillSet.some(s => s.includes(tl)) || text.includes(tl);
+      const tl   = t.toLowerCase();
+      const tlN  = norm(t);
+      return skillSet.some(s => s.includes(tl) || norm(s).includes(tlN))
+        || text.includes(tl) || norm(text).includes(tlN);
     });
     if (!hasStack) return false;
   }
-
-  // Budget filters
   if (cfg.minBudget) {
     const min = parseFloat(cfg.minBudget);
     if (!isNaN(min) && parseBudgetMin(project.budget) < min) return false;
@@ -169,13 +241,10 @@ function matchesConfig(project: ScrapedProject, cfg: AutomationConfig): boolean 
     const max = parseFloat(cfg.maxBudget);
     if (!isNaN(max) && parseBudgetMin(project.budget) > max) return false;
   }
-
-  // Verification filters (only check if flag set AND project data is present)
   if (cfg.identityVerified && project.identityVerified === false) return false;
   if (cfg.paymentVerified  && project.paymentVerified  === false) return false;
   if (cfg.depositMade      && project.depositMade      === false) return false;
   if (cfg.profileCompleted && project.profileCompleted === false) return false;
-
   return true;
 }
 
@@ -186,50 +255,45 @@ function fmt(d: Date): string {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function Automation() {
-  const navigate = useNavigate();
+  const navigate     = useNavigate();
+  const queryClient  = useQueryClient();
 
-  // Persisted config
   const [config, setConfig] = useState<AutomationConfig>(() =>
     loadStorage<AutomationConfig>('fos_autoConfig', DEFAULT_CONFIG),
   );
-
-  // Runtime state — matchedProjects intentionally NOT loaded from storage.
-  // Starting fresh each page open ensures scraping-OFF means empty results.
-  const [enabled,         setEnabled]         = useState(false);
+  const [enabled,         setEnabled]         = useState(() =>
+    loadStorage<boolean>('fos_autoEnabled', false),
+  );
   const [running,         setRunning]          = useState(false);
-  const [matchedProjects, setMatchedProjects]  = useState<ScrapedProject[]>([]);
-
-  // Saved projects — shared localStorage key with Project Search
-  const [savedProjects, setSavedProjects] = useState<ScrapedProject[]>(() =>
+  const [matchedProjects, setMatchedProjects]  = useState<ScrapedProject[]>(() =>
+    loadStorage<ScrapedProject[]>('fos_matchedProjects', []),
+  );
+  const [savedProjects,   setSavedProjects]    = useState<ScrapedProject[]>(() =>
     loadStorage<ScrapedProject[]>('fos_savedProjects', []),
   );
-
-  const [logs,           setLogs]           = useState<RunLog[]>([]);
-  const [lastRun,        setLastRun]        = useState<string | null>(null);
-  const [nextRunIn,      setNextRunIn]      = useState<string>('—');
-  const [showFilters,    setShowFilters]    = useState(true);
-  const [stackSearch,    setStackSearch]    = useState('');
-  const [matchedPage,    setMatchedPage]    = useState(1);
-  const [showSavedPanel, setShowSavedPanel] = useState(false);
-
-  const intervalRef    = useRef<ReturnType<typeof setInterval> | null>(null);
-  const countdownRef   = useRef<ReturnType<typeof setInterval> | null>(null);
-  const nextFireRef    = useRef<number | null>(null);
-  const runCycleRef    = useRef<((manual?: boolean) => Promise<void>) | null>(null);
-  const seenAutoTsRef  = useRef<Set<string>>(new Set());
-
-  // Scraper online status
-  const [scraperOnline, setScraperOnline] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    scraperApi.status()
-      .then(d => setScraperOnline(d?.status === 'online'))
-      .catch(() => setScraperOnline(false));
-  }, []);
-
-  // Extension detection (same as Scraper.tsx)
+  const [logs,            setLogs]             = useState<RunLog[]>([]);
+  const [lastRun,         setLastRun]          = useState<string | null>(null);
+  const [nextRunIn,       setNextRunIn]        = useState<string>('—');
+  const [showFilters,     setShowFilters]      = useState(true);
+  const [stackSearch,     setStackSearch]      = useState('');
+  const [matchedPage,     setMatchedPage]      = useState(1);
+  const [showSavedPanel,  setShowSavedPanel]   = useState(false);
+  const [scraperOnline,   setScraperOnline]    = useState<boolean | null>(null);
   const [extensionInstalled, setExtensionInstalled] = useState(false);
   const [extensionStatus,    setExtensionStatus]    = useState('');
+  // true while a change originated from the extension (suppresses write-back loop)
+  const isUpdatingFromExtRef = useRef(false);
+  // debounce timer for pushing config changes to extension
+  const configSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const intervalRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countdownRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const nextFireRef   = useRef<number | null>(null);
+  const runCycleRef   = useRef<((manual?: boolean) => Promise<void>) | null>(null);
+  const seenAutoTsRef   = useRef<Set<string>>(new Set());
+  const prevPlatformRef = useRef(config.platform);
+
+  // ── Extension detection ────────────────────────────────────────────────────
 
   useEffect(() => {
     const win = window as Window & { __FOS_EXTENSION_INSTALLED__?: boolean };
@@ -238,25 +302,105 @@ export default function Automation() {
     return () => clearTimeout(t);
   }, []);
 
-  // Extension event listener wired up after addLog is defined (see below)
+  // ── Load initial extension state once the extension is detected ────────────
 
-  // Persist config
+  useEffect(() => {
+    if (!extensionInstalled) return;
+    window.dispatchEvent(new CustomEvent('FOS_GET_EXT_STATE'));
+  }, [extensionInstalled]);
+
+  // ── Apply extension state (used for both initial load and delta updates) ───
+
+  const applyExtState = useCallback((state: ExtState) => {
+    isUpdatingFromExtRef.current = true;
+
+    if (typeof state.autoScrape === 'boolean') {
+      setEnabled(state.autoScrape);
+    }
+    const patch = extStateToConfigPatch(state);
+    if (Object.keys(patch).length > 0) {
+      setConfig(prev => ({ ...prev, ...patch }));
+    }
+
+    // Clear the suppression flag after React has processed the queued state updates.
+    setTimeout(() => { isUpdatingFromExtRef.current = false; }, 200);
+  }, []);
+
+  // ── Listen for extension state events ─────────────────────────────────────
+
+  useEffect(() => {
+    function onExtState(e: Event) {
+      applyExtState((e as CustomEvent<ExtState>).detail || {});
+    }
+    function onExtStateChanged(e: Event) {
+      applyExtState((e as CustomEvent<ExtState>).detail || {});
+    }
+    window.addEventListener('FOS_EXT_STATE',         onExtState);
+    window.addEventListener('FOS_EXT_STATE_CHANGED', onExtStateChanged);
+    return () => {
+      window.removeEventListener('FOS_EXT_STATE',         onExtState);
+      window.removeEventListener('FOS_EXT_STATE_CHANGED', onExtStateChanged);
+    };
+  }, [applyExtState]);
+
+  // ── Persist config to localStorage ────────────────────────────────────────
+
   useEffect(() => {
     localStorage.setItem('fos_autoConfig', JSON.stringify(config));
   }, [config]);
 
-  // Persist saved projects (shared with Project Search)
+  useEffect(() => {
+    localStorage.setItem('fos_autoEnabled', JSON.stringify(enabled));
+  }, [enabled]);
+
+  useEffect(() => {
+    localStorage.setItem('fos_matchedProjects', JSON.stringify(matchedProjects.slice(0, 200)));
+  }, [matchedProjects]);
+
   useEffect(() => {
     localStorage.setItem('fos_savedProjects', JSON.stringify(savedProjects));
   }, [savedProjects]);
 
-  // ── Logging ──────────────────────────────────────────────────────────────────
+  // ── Re-filter matched projects when platform changes ──────────────────────
+  // Prevents projects from the previously selected platform from lingering.
+  useEffect(() => {
+    if (prevPlatformRef.current === config.platform) return;
+    prevPlatformRef.current = config.platform;
+    if (config.platform !== 'both') {
+      setMatchedProjects(prev => prev.filter(p => p.platform === config.platform));
+    }
+  }, [config.platform]);
+
+  // ── Push config changes back to extension (debounced, skip loop) ──────────
+
+  useEffect(() => {
+    if (!extensionInstalled || isUpdatingFromExtRef.current) return;
+    if (configSyncTimerRef.current) clearTimeout(configSyncTimerRef.current);
+    configSyncTimerRef.current = setTimeout(() => {
+      if (isUpdatingFromExtRef.current) return; // still syncing from ext
+      window.dispatchEvent(new CustomEvent('FOS_SET_EXT_STATE', {
+        detail: configToExtState(config),
+      }));
+    }, 600);
+    return () => { if (configSyncTimerRef.current) clearTimeout(configSyncTimerRef.current); };
+  }, [config, extensionInstalled]);
+
+  // ── Scraper status ────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    scraperApi.status()
+      .then(d => setScraperOnline(d?.status === 'online'))
+      .catch(() => setScraperOnline(false));
+  }, []);
+
+  // ── Logging ───────────────────────────────────────────────────────────────
 
   const addLog = useCallback((message: string, type: RunLog['type'] = 'info') => {
     setLogs(prev => [{ ts: fmt(new Date()), message, type }, ...prev].slice(0, 50));
   }, []);
 
-  // Listen for extension scrape events — wired here so addLog is already declared
+  // ── Extension scrape event listener ───────────────────────────────────────
+
   useEffect(() => {
     function onScrapeEvent(e: Event) {
       const msg = (e as CustomEvent<{ type: string; message?: string }>).detail;
@@ -266,21 +410,31 @@ export default function Automation() {
       } else if (msg.type === 'SCRAPE_DONE') {
         setExtensionStatus('');
         setRunning(false);
+        // Give backend 2 s to store the results, then fetch immediately
+        setTimeout(() => {
+          queryClient.invalidateQueries({ queryKey: ['automation-auto-results'] });
+        }, 2000);
       }
     }
     window.addEventListener('FOS_SCRAPE_EVENT', onScrapeEvent);
     return () => window.removeEventListener('FOS_SCRAPE_EVENT', onScrapeEvent);
   }, [addLog]);
 
-  // ── Extension auto-results polling ────────────────────────────────────────────
+  // ── Auto-results polling ──────────────────────────────────────────────────
+  // Poll whenever the page thinks automation is active. With extension sync,
+  // `enabled` mirrors the extension's autoScrape flag — so polling runs
+  // automatically when the extension is running, even after a page refresh.
 
-  // Only poll when automation is enabled — no data fetching when stopped/idle.
+  // Poll whenever automation is enabled OR the extension is installed.
+  // Extension-installed mode polls passively so results from any scrape
+  // (manual popup scrape, auto alarm, Test Now) appear without `enabled` being true.
+  const isPollingActive = enabled || extensionInstalled;
   const { data: autoResultsData } = useQuery({
-    queryKey: ['automation-auto-results'],
-    queryFn: scraperApi.getAutoResults,
-    enabled: enabled,
-    refetchInterval: enabled ? 10000 : false,
-    staleTime: 0,
+    queryKey:        ['automation-auto-results'],
+    queryFn:         scraperApi.getAutoResults,
+    enabled:         isPollingActive,
+    refetchInterval: isPollingActive ? 10_000 : false,
+    staleTime:       0,
   });
 
   useEffect(() => {
@@ -295,9 +449,9 @@ export default function Automation() {
         const total   = l.received ?? matched;
         const detail  = total > matched ? `${matched} matched (${total} scraped)` : `${matched} project(s)`;
         newEntries.push({
-          ts: fmt(new Date(l.ts)),
-          message: `[Extension auto-scrape] ${detail} for "${l.query}" on ${l.platform}`,
-          type: 'success',
+          ts:      fmt(new Date(l.ts)),
+          message: `[Auto-scrape] ${detail} for "${l.query}" on ${l.platform}`,
+          type:    'success',
         });
       }
       if (newEntries.length > 0) {
@@ -306,22 +460,32 @@ export default function Automation() {
     }
 
     if (Array.isArray(autoResultsData.projects) && autoResultsData.projects.length > 0) {
-      // Apply automation filters — only matched projects flow in, then auto-save
       const incomingProjects = autoResultsData.projects as ScrapedProject[];
+      // Platform filter — only show projects from the selected platform
+      const platformFiltered = config.platform === 'both'
+        ? incomingProjects
+        : incomingProjects.filter(p => p.platform === config.platform);
+      // Apply automation filters only when a query/config is set; otherwise show everything
       const filtered = config.query.trim()
-        ? incomingProjects.filter(p => matchesConfig(p, config))
-        : incomingProjects;
+        ? platformFiltered.filter(p => matchesConfig(p, config))
+        : platformFiltered;
+
+      console.log(
+        `[Automation] auto-results poll: received=${incomingProjects.length}` +
+        ` platform_filtered=${platformFiltered.length} matched=${filtered.length}`,
+      );
 
       setMatchedProjects(prev => {
         const existingIds = new Set(prev.map(p => p.id));
         const newOnes = filtered.filter(p => !existingIds.has(p.id));
         if (newOnes.length > 0) {
-          setTimeout(() => addLog(`[Extension] ${newOnes.length} new project(s) matched filters → auto-saved`, 'success'), 0);
+          console.log(`[Automation] Adding ${newOnes.length} new project(s) to UI`);
+          setTimeout(() => addLog(`${newOnes.length} new project(s) added (${incomingProjects.length} received → ${filtered.length} matched)`, 'success'), 0);
         }
         return newOnes.length > 0 ? [...newOnes, ...prev] : prev;
       });
 
-      // Auto-save filtered matches to DB
+      // Auto-save filtered matches
       setSavedProjects(prev => {
         const existingIds = new Set(prev.map(p => p.id));
         const toSave = filtered.filter(p => !existingIds.has(p.id));
@@ -337,7 +501,7 @@ export default function Automation() {
     }
   }, [autoResultsData, config, addLog]);
 
-  // ── Extension trigger helper ──────────────────────────────────────────────
+  // ── Extension trigger helper ───────────────────────────────────────────────
 
   function triggerExtScrape(query: string, platform: string) {
     if (!extensionInstalled) return;
@@ -345,10 +509,10 @@ export default function Automation() {
       detail: { query, platform: platform || 'both' },
     }));
     setExtensionStatus('Extension scraping…');
-    addLog(`Triggered extension scrape for "${query}" on ${platform}`, 'info');
+    addLog(`Triggered extension scrape for "${query}"`, 'info');
   }
 
-  // ── Run cycle ────────────────────────────────────────────────────────────────
+  // ── Run cycle (used when extension is NOT installed) ──────────────────────
 
   const runCycle = useCallback(async (manual = false) => {
     if (running) return;
@@ -371,35 +535,27 @@ export default function Automation() {
         limit:    config.fetchLimit,
       });
 
-      // Log per-platform outcomes so the user knows exactly what happened
       const outcomes = (data.platformOutcomes ?? {}) as Record<string, { status: string; count: number; message: string }>;
       Object.entries(outcomes).forEach(([platform, outcome]) => {
         const cap = platform.charAt(0).toUpperCase() + platform.slice(1);
         if (outcome.status === 'success') {
           addLog(`${cap}: fetched ${outcome.count} project(s)`, 'info');
         } else if (outcome.status === 'platform_blocked') {
-          addLog(`${cap}: blocked by platform — ${outcome.message || 'try connecting your account in Profile'}`, 'warn');
+          addLog(`${cap}: blocked — ${outcome.message || 'connect your account in Profile'}`, 'warn');
         } else if (outcome.status === 'empty') {
-          addLog(`${cap}: online but returned 0 results for this query`, 'info');
+          addLog(`${cap}: 0 results for this query`, 'info');
         } else if (outcome.status === 'error') {
-          addLog(`${cap}: error — ${outcome.message || 'unknown error'}`, 'error');
+          addLog(`${cap}: ${outcome.message || 'error'}`, 'error');
         }
       });
 
       const fetched: ScrapedProject[] = data.projects ?? [];
-      if (Object.keys(outcomes).length === 0) {
-        // Fallback if scraper doesn't return outcomes (cached response)
-        addLog(`Fetched ${fetched.length} projects`, 'info');
-      }
+      if (Object.keys(outcomes).length === 0) addLog(`Fetched ${fetched.length} projects`, 'info');
 
       const newMatches = fetched.filter(p => matchesConfig(p, config));
-      addLog(
-        `${newMatches.length} matched your criteria`,
-        newMatches.length > 0 ? 'success' : 'info',
-      );
+      addLog(`${newMatches.length} matched`, newMatches.length > 0 ? 'success' : 'info');
 
       if (newMatches.length > 0) {
-        // --- Update matched projects list (dedup) ---
         let dedupedCount = 0;
         setMatchedProjects(prev => {
           const existingIds = new Set(prev.map(p => p.id));
@@ -407,74 +563,56 @@ export default function Automation() {
           dedupedCount = deduped.length;
           return deduped.length > 0 ? [...deduped, ...prev] : prev;
         });
-
-        // --- Auto-save matched projects (dedup + DB persist) ---
         setSavedProjects(prev => {
           const existingIds = new Set(prev.map(p => p.id));
           const toSave = newMatches.filter(p => !existingIds.has(p.id));
-
-          // Persist each new project to DB (fire-and-forget, errors are non-fatal)
           toSave.forEach(p => {
             scraperApi.saveProject({
-              id:           p.id,
-              title:        p.title,
-              description:  p.description,
-              budget:       p.budget,
-              skills:       p.skills,
-              clientCountry: p.clientCountry,
-              url:          p.url,
-              platform:     p.platform,
-            }).catch(() => { /* ignore save errors — localStorage already has it */ });
+              id: p.id, title: p.title, description: p.description,
+              budget: p.budget, skills: p.skills, clientCountry: p.clientCountry,
+              url: p.url, platform: p.platform,
+            }).catch(() => {});
           });
-
-          if (toSave.length > 0) {
-            // Log outside state updater to avoid side-effect in pure function
-            setTimeout(() => addLog(`Auto-saved ${toSave.length} project(s) to Saved`, 'success'), 0);
-          }
-
+          if (toSave.length > 0) setTimeout(() => addLog(`Auto-saved ${toSave.length} project(s)`, 'success'), 0);
           return toSave.length > 0 ? [...toSave, ...prev] : prev;
         });
-
-        // Log dedup info after state update queued
         setTimeout(() => {
           if (dedupedCount < newMatches.length) {
             addLog(`${newMatches.length - dedupedCount} duplicate(s) skipped`, 'info');
           }
         }, 0);
       }
-
       setLastRun(fmt(new Date()));
     } catch (err: unknown) {
       const isOffline =
         err instanceof Error &&
         (err.message.includes('503') || err.message.includes('Network') || err.message.includes('ECONNREFUSED'));
       if (isOffline && extensionInstalled) {
-        addLog('Scraper offline — using extension as fallback', 'warn');
+        addLog('Scraper offline — falling back to extension', 'warn');
         triggerExtScrape(config.query, config.platform);
-        // runCycle stays running=true until FOS_SCRAPE_EVENT SCRAPE_DONE fires
         return;
       } else if (isOffline) {
-        addLog('Scraper service is offline. Install the Freelancer OS extension or start python api.py', 'error');
+        addLog('Scraper offline. Install the extension or start python api.py', 'error');
       } else {
         addLog(`Cycle error: ${err instanceof Error ? err.message : String(err)}`, 'error');
       }
     } finally {
       setRunning(false);
     }
-  }, [running, config, addLog, extensionInstalled]);
+  }, [running, config, addLog, extensionInstalled]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Keep ref in sync so the scheduler can call the latest version without
-  // being listed as a useEffect dependency (avoids interval reset on every cycle).
   useEffect(() => { runCycleRef.current = runCycle; }, [runCycle]);
 
-  // ── Scheduler ────────────────────────────────────────────────────────────────
+  // ── Scheduler (only active when extension is NOT installed) ───────────────
+  // When the extension is present, its chrome.alarms handle timing. The page
+  // only needs to poll getAutoResults and react to the FOS_SCRAPE_EVENT.
 
   useEffect(() => {
-    if (!enabled) {
+    if (!enabled || extensionInstalled) {
       if (intervalRef.current)  clearInterval(intervalRef.current);
       if (countdownRef.current) clearInterval(countdownRef.current);
       nextFireRef.current = null;
-      setNextRunIn('—');
+      setNextRunIn(extensionInstalled && enabled ? 'Via extension' : '—');
       return;
     }
 
@@ -498,9 +636,9 @@ export default function Automation() {
       if (intervalRef.current)  clearInterval(intervalRef.current);
       if (countdownRef.current) clearInterval(countdownRef.current);
     };
-  }, [enabled, config.intervalMinutes]); // runCycle intentionally omitted — called via runCycleRef
+  }, [enabled, config.intervalMinutes, extensionInstalled]);
 
-  // ── Config helpers ────────────────────────────────────────────────────────────
+  // ── Config helpers ─────────────────────────────────────────────────────────
 
   function setField<K extends keyof AutomationConfig>(key: K, value: AutomationConfig[K]) {
     setConfig(prev => ({ ...prev, [key]: value }));
@@ -515,18 +653,46 @@ export default function Automation() {
     }));
   }
 
+  function toggleDay(d: number) {
+    setConfig(prev => ({
+      ...prev,
+      activeDays: (prev.activeDays ?? []).includes(d)
+        ? (prev.activeDays ?? []).filter(x => x !== d)
+        : [...(prev.activeDays ?? []), d],
+    }));
+  }
+
+  // ── Start / Stop ──────────────────────────────────────────────────────────
+
   function handleToggleEnable() {
-    if (!enabled && !config.query.trim()) {
+    // When extension is installed, keywords come from extension storage — skip local query check
+    if (!enabled && !config.query.trim() && !extensionInstalled) {
       addLog('Set a search query before enabling automation', 'warn');
       return;
     }
-    setEnabled(v => !v);
-    if (!enabled) addLog('Automation enabled', 'success');
-    else          addLog('Automation stopped', 'info');
+    const next = !enabled;
+    setEnabled(next);
+
+    // Sync toggle back to extension
+    if (extensionInstalled) {
+      window.dispatchEvent(new CustomEvent('FOS_SET_EXT_STATE', {
+        detail: { autoScrape: next },
+      }));
+    }
+
+    if (next) addLog('Automation enabled', 'success');
+    else      addLog('Automation stopped', 'info');
   }
 
   function handleTest() {
-    runCycle(true);
+    if (extensionInstalled) {
+      // Drive the test through the extension so results flow through auto-results
+      if (!config.query.trim()) { addLog('Set a search query first', 'warn'); return; }
+      setRunning(true);
+      triggerExtScrape(config.query, config.platform);
+    } else {
+      runCycle(true);
+    }
   }
 
   function saveProjectManual(p: ScrapedProject) {
@@ -547,9 +713,7 @@ export default function Automation() {
   }
 
   function clearSavedProjects() {
-    savedProjects.forEach(p => {
-      scraperApi.deleteSaved(p.id).catch(() => {});
-    });
+    savedProjects.forEach(p => scraperApi.deleteSaved(p.id).catch(() => {}));
     setSavedProjects([]);
   }
 
@@ -561,16 +725,15 @@ export default function Automation() {
     setMatchedProjects([]);
     setMatchedPage(1);
     addLog('Matched projects cleared', 'info');
-    // Clear Redis cache so data doesn't reappear on next poll
     scraperApi.clearResults().catch(() => {});
   }
 
-  // ── Derived state ─────────────────────────────────────────────────────────────
+  // ── Derived state ──────────────────────────────────────────────────────────
 
-  const withinWindow     = isWithinWindow(config.startTime, config.endTime);
-  const totalMatchPages  = Math.max(1, Math.ceil(matchedProjects.length / AUTO_PAGE_SIZE));
-  const safeMPage        = Math.min(matchedPage, totalMatchPages);
-  const visibleMatched   = matchedProjects.slice((safeMPage - 1) * AUTO_PAGE_SIZE, safeMPage * AUTO_PAGE_SIZE);
+  const withinWindow    = isWithinWindow(config.startTime, config.endTime);
+  const totalMatchPages = Math.max(1, Math.ceil(matchedProjects.length / AUTO_PAGE_SIZE));
+  const safeMPage       = Math.min(matchedPage, totalMatchPages);
+  const visibleMatched  = matchedProjects.slice((safeMPage - 1) * AUTO_PAGE_SIZE, safeMPage * AUTO_PAGE_SIZE);
   const stackSuggestions = stackSearch.trim().length === 0 ? [] :
     TECH_SKILLS
       .filter(s => s.toLowerCase().includes(stackSearch.toLowerCase()) && !config.techStack.includes(s))
@@ -579,28 +742,25 @@ export default function Automation() {
   const statusLabel = enabled
     ? running
       ? 'Running cycle...'
-      : withinWindow
-        ? `Active — next in ${nextRunIn}`
-        : `Paused — outside window`
+      : extensionInstalled
+        ? 'Active — extension running'
+        : withinWindow
+          ? `Active — next in ${nextRunIn}`
+          : 'Paused — outside window'
     : 'Stopped';
 
   const statusColor = enabled
     ? running
       ? 'text-primary'
-      : withinWindow
-        ? 'text-emerald-600'
-        : 'text-amber-600'
+      : 'text-emerald-600'
     : 'text-slate-400';
 
   const statusDot = enabled
     ? running
       ? 'bg-primary animate-pulse'
-      : withinWindow
-        ? 'bg-emerald-500'
-        : 'bg-amber-400'
+      : 'bg-emerald-500'
     : 'bg-slate-300';
 
-  // Active filter count badge
   const activeFilterCount = [
     config.maxProposals !== 'any',
     !!config.minClientRating,
@@ -620,25 +780,25 @@ export default function Automation() {
     <div className="flex-1 overflow-y-auto">
     <div className="page-shell">
 
-      {/* ── Header ─────────────────────────────────────────────────────────── */}
+      {/* ── Header ──────────────────────────────────────────────────────── */}
       <div className="flex items-start justify-between mb-6 gap-4 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-dark flex items-center gap-2">
             <Bot size={22} className="text-primary" /> Automation
           </h1>
           <p className="text-slate-500 mt-0.5">
-            Auto-fetch and save projects that match your criteria on a schedule
+            {extensionInstalled
+              ? 'Extension-driven automation — settings sync with the popup in real time'
+              : 'Auto-fetch and save projects that match your criteria on a schedule'}
           </p>
         </div>
 
         <div className="flex items-center gap-3 flex-wrap">
-          {/* Status pill */}
           <span className={clsx('flex items-center gap-1.5 text-sm font-medium', statusColor)}>
             <span className={clsx('w-2 h-2 rounded-full inline-block', statusDot)} />
             {statusLabel}
           </span>
 
-          {/* Saved panel toggle */}
           <button
             onClick={() => setShowSavedPanel(v => !v)}
             className={clsx(
@@ -652,7 +812,6 @@ export default function Automation() {
             Saved {savedProjects.length > 0 && `(${savedProjects.length})`}
           </button>
 
-          {/* Scraper status indicator */}
           <span className={clsx(
             'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border',
             scraperOnline === true
@@ -662,14 +821,9 @@ export default function Automation() {
                 : 'bg-slate-50 border-slate-200 text-slate-400',
           )}>
             <Zap size={10} />
-            {scraperOnline === true
-              ? 'Scraper Online'
-              : scraperOnline === false
-                ? 'Scraper Offline'
-                : 'Checking...'}
+            {scraperOnline === true ? 'Scraper Online' : scraperOnline === false ? 'Scraper Offline' : 'Checking...'}
           </span>
 
-          {/* Extension indicator */}
           {extensionInstalled && (
             <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border bg-primary/5 border-primary/20 text-primary">
               <Puzzle size={10} /> Extension Active
@@ -680,23 +834,33 @@ export default function Automation() {
 
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,440px)_1fr] gap-6">
 
-        {/* ── LEFT: Config ─────────────────────────────────────────────────── */}
+        {/* ── LEFT: Config ────────────────────────────────────────────── */}
         <div className="space-y-4">
 
           {/* Search query + platform */}
           <div className="card p-5 space-y-4">
             <h2 className="text-sm font-semibold text-dark flex items-center gap-2">
               <SlidersHorizontal size={14} className="text-primary" /> Search Configuration
+              {extensionInstalled && (
+                <span className="ml-auto text-[10px] text-primary/60 font-normal flex items-center gap-1">
+                  <Puzzle size={9} /> synced with extension
+                </span>
+              )}
             </h2>
 
             <div>
-              <label className="label">Search Query</label>
+              <label className="label">Search Keywords</label>
               <input
                 value={config.query}
                 onChange={e => setField('query', e.target.value)}
                 className="input"
                 placeholder="e.g. React developer, Python scraper..."
               />
+              {extensionInstalled && (
+                <p className="text-[10px] text-slate-400 mt-1">
+                  Changes sync to the extension popup automatically
+                </p>
+              )}
             </div>
 
             <div>
@@ -758,6 +922,30 @@ export default function Automation() {
                   onChange={e => setField('endTime', e.target.value)}
                   className="input"
                 />
+              </div>
+            </div>
+
+            {/* Active days */}
+            <div>
+              <label className="label flex items-center gap-1.5">
+                <Calendar size={11} /> Active Days
+              </label>
+              <div className="flex gap-1.5 mt-1">
+                {DAY_LABELS.map((label, idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => toggleDay(idx)}
+                    className={clsx(
+                      'w-8 h-8 rounded-lg text-xs font-semibold border transition-colors',
+                      (config.activeDays ?? []).includes(idx)
+                        ? 'bg-primary text-white border-primary'
+                        : 'bg-white text-slate-400 border-slate-200 hover:border-primary/30',
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
             </div>
 
@@ -824,7 +1012,7 @@ export default function Automation() {
             )}
           </div>
 
-          {/* Advanced filters — same fields as Project Search */}
+          {/* Advanced filters */}
           <div className="card p-5 space-y-3">
             <button
               type="button"
@@ -847,8 +1035,6 @@ export default function Automation() {
 
             {showFilters && (
               <div className="space-y-4 pt-1">
-
-                {/* Row 1: Max Proposals + Min Client Rating */}
                 <div className="flex flex-wrap gap-4">
                   <div>
                     <label className="label text-[11px]">Max Proposals</label>
@@ -895,13 +1081,11 @@ export default function Automation() {
                   </div>
                 </div>
 
-                {/* Row 2: Budget range */}
                 <div className="flex flex-wrap gap-4">
                   <div className="flex-1 min-w-28">
                     <label className="label text-[11px]">Min Budget ($)</label>
                     <input
-                      type="number"
-                      min="0"
+                      type="number" min="0"
                       value={config.minBudget}
                       onChange={e => setField('minBudget', e.target.value)}
                       className="input text-xs"
@@ -911,8 +1095,7 @@ export default function Automation() {
                   <div className="flex-1 min-w-28">
                     <label className="label text-[11px]">Max Budget ($)</label>
                     <input
-                      type="number"
-                      min="0"
+                      type="number" min="0"
                       value={config.maxBudget}
                       onChange={e => setField('maxBudget', e.target.value)}
                       className="input text-xs"
@@ -921,7 +1104,6 @@ export default function Automation() {
                   </div>
                 </div>
 
-                {/* Row 3: Include / Exclude keywords */}
                 <div className="flex flex-wrap gap-4">
                   <div className="flex-1 min-w-48">
                     <label className="label text-[11px]">
@@ -947,7 +1129,6 @@ export default function Automation() {
                   </div>
                 </div>
 
-                {/* Row 4: Client Verification checkboxes */}
                 <div>
                   <label className="label text-[11px] mb-2">Client Verification</label>
                   <div className="flex flex-wrap gap-3">
@@ -969,11 +1150,10 @@ export default function Automation() {
                     ))}
                   </div>
                   <p className="text-[10px] text-slate-400 mt-1.5">
-                    Verification flags are matched against project data when available.
+                    Flags are enforced only when the platform provides the data.
                   </p>
                 </div>
 
-                {/* Clear filters */}
                 {activeFilterCount > 0 && (
                   <button
                     type="button"
@@ -1021,7 +1201,6 @@ export default function Automation() {
                   'bg-white border-slate-200 text-slate-600 hover:border-primary/40 hover:text-primary',
                   (running || (scraperOnline === false && !extensionInstalled)) && 'opacity-50 cursor-not-allowed',
                 )}
-                title={extensionInstalled ? 'Run one cycle via extension (ignores time window)' : 'Run one cycle immediately (ignores time window)'}
               >
                 {running
                   ? <><RefreshCw size={12} className="animate-spin" /> {extensionStatus || 'Running...'}</>
@@ -1048,16 +1227,14 @@ export default function Automation() {
           {/* Activity log */}
           {logs.length > 0 && (
             <div className="card p-4">
-              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">
-                Activity Log
-              </p>
+              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Activity Log</p>
               <div className="space-y-1 max-h-40 overflow-y-auto">
                 {logs.map((l, i) => (
                   <p key={i} className={clsx(
                     'text-[11px] flex gap-2',
                     l.type === 'success' ? 'text-emerald-600'
-                      : l.type === 'warn'    ? 'text-amber-600'
-                      : l.type === 'error'   ? 'text-red-500'
+                      : l.type === 'warn'  ? 'text-amber-600'
+                      : l.type === 'error' ? 'text-red-500'
                       : 'text-slate-500',
                   )}>
                     <span className="text-slate-300 flex-shrink-0">{l.ts}</span>
@@ -1069,7 +1246,7 @@ export default function Automation() {
           )}
         </div>
 
-        {/* ── RIGHT: Matched Projects ───────────────────────────────────────── */}
+        {/* ── RIGHT: Matched Projects ──────────────────────────────────── */}
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="text-sm font-semibold text-dark flex items-center gap-2">
@@ -1082,29 +1259,28 @@ export default function Automation() {
               )}
             </h2>
             {matchedProjects.length > 0 && (
-              <button
-                onClick={clearMatched}
-                className="text-xs text-slate-400 hover:text-danger flex items-center gap-1"
-              >
+              <button onClick={clearMatched} className="text-xs text-slate-400 hover:text-danger flex items-center gap-1">
                 <X size={11} /> Clear all
               </button>
             )}
           </div>
 
-          {/* Empty state */}
           {matchedProjects.length === 0 && (
             <div className="card p-12 text-center text-slate-400">
               <Bot size={32} className="mx-auto mb-3 text-slate-200" />
               <p className="text-sm font-medium">No matches yet</p>
               <p className="text-xs text-slate-400 mt-1">
-                {config.query
-                  ? 'Click "Test Now" or "Start Automation" to fetch matching projects.'
-                  : 'Set a search query, then test or start automation.'}
+                {extensionInstalled
+                  ? enabled
+                    ? 'Waiting for the extension to push results…'
+                    : 'Enable automation or click Test Now.'
+                  : config.query
+                    ? 'Click "Test Now" or "Start Automation" to fetch projects.'
+                    : 'Set a search query, then test or start automation.'}
               </p>
             </div>
           )}
 
-          {/* Project cards */}
           <div className="space-y-3">
             {visibleMatched.map(project => {
               const isSaved = savedProjects.some(p => p.id === project.id);
@@ -1153,18 +1329,11 @@ export default function Automation() {
                         )}
                       </div>
 
-                      {/* Verification badges */}
                       {(project.identityVerified || project.paymentVerified || project.profileCompleted) && (
                         <div className="flex flex-wrap gap-1 mt-2">
-                          {project.identityVerified && (
-                            <span className="badge badge-success text-[10px]">ID Verified</span>
-                          )}
-                          {project.paymentVerified && (
-                            <span className="badge badge-success text-[10px]">Payment Verified</span>
-                          )}
-                          {project.profileCompleted && (
-                            <span className="badge badge-success text-[10px]">Profile Complete</span>
-                          )}
+                          {project.identityVerified && <span className="badge badge-success text-[10px]">ID Verified</span>}
+                          {project.paymentVerified  && <span className="badge badge-success text-[10px]">Payment Verified</span>}
+                          {project.profileCompleted && <span className="badge badge-success text-[10px]">Profile Complete</span>}
                         </div>
                       )}
 
@@ -1180,7 +1349,6 @@ export default function Automation() {
                       )}
                     </div>
 
-                    {/* Actions */}
                     <div className="flex flex-col gap-1.5 flex-shrink-0">
                       <a
                         href={project.url}
@@ -1216,7 +1384,6 @@ export default function Automation() {
             })}
           </div>
 
-          {/* Pagination */}
           {matchedProjects.length > AUTO_PAGE_SIZE && (
             <div className="flex items-center justify-center gap-2 mt-4">
               <button
@@ -1245,7 +1412,7 @@ export default function Automation() {
     </div>
     </div>
 
-    {/* ── Saved Projects Panel (slide-in from right) ─────────────────────────── */}
+    {/* ── Saved Projects Panel ──────────────────────────────────────────────── */}
     {showSavedPanel && (
       <div className="w-72 flex-shrink-0 bg-white border-l border-slate-200 flex flex-col h-full">
         <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100">
@@ -1294,14 +1461,12 @@ export default function Automation() {
                     <button
                       onClick={() => goToAnalyze(p)}
                       className="text-[10px] px-2 py-1 rounded border border-slate-200 text-slate-600 hover:border-primary/40 hover:text-primary transition-colors"
-                      title="AI Analysis"
                     >
                       <Brain size={10} />
                     </button>
                     <button
                       onClick={() => unsaveProject(p.id)}
                       className="text-[10px] px-2 py-1 rounded border border-slate-200 text-slate-400 hover:border-red-200 hover:text-red-500 transition-colors"
-                      title="Remove"
                     >
                       <X size={10} />
                     </button>

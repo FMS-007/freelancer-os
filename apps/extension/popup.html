@@ -3,24 +3,28 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Freelancer OS Connector</title>
+  <title>Freelancer OS</title>
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
+
   <!-- Header -->
   <div class="header">
-    <img src="icons/icon48.png" alt="logo" class="logo" />
-    <div class="header-text">
-      <span class="header-title">Freelancer OS</span>
-      <span class="header-sub">Connector v1.0</span>
+    <div class="header-left">
+      <img src="icons/icon48.png" alt="logo" class="logo" />
+      <div class="header-text">
+        <span class="header-title">Freelancer OS</span>
+        <span class="header-sub">Connector</span>
+      </div>
+    </div>
+    <div id="syncBadge" class="sync-badge sync-badge-active">
+      <span class="sync-dot"></span>Live Sync
     </div>
   </div>
 
-  <!-- ── Section 1: API Connection ── -->
+  <!-- ── API Connection ── -->
   <div class="section">
-    <div class="section-title">
-      <span class="section-icon">⚙️</span> API Connection
-    </div>
+    <div class="section-title">API Connection</div>
 
     <div class="field">
       <label class="label" for="apiUrl">API URL</label>
@@ -30,12 +34,10 @@
     <div class="field">
       <label class="label" for="authToken">Auth Token</label>
       <input type="password" id="authToken" class="input" placeholder="Paste your extension token..." />
-      <p class="field-hint">
-        Get token: Freelancer OS → Settings → Chrome Extension → Generate Token
-      </p>
+      <p class="field-hint">Settings → Chrome Extension → Generate Token</p>
     </div>
 
-    <button id="btnSaveConnect" class="btn btn-primary">💾 Save &amp; Test</button>
+    <button id="btnSaveConnect" class="btn btn-primary btn-full">Save &amp; Test Connection</button>
 
     <div id="apiStatus" class="status-row hidden">
       <span id="apiStatusDot" class="dot"></span>
@@ -43,13 +45,10 @@
     </div>
   </div>
 
-  <!-- ── Section 2: Platform Accounts ── -->
+  <!-- ── Platform Accounts ── -->
   <div class="section">
-    <div class="section-title">
-      <span class="section-icon">🔗</span> Platform Accounts
-    </div>
+    <div class="section-title">Platform Accounts</div>
 
-    <!-- Upwork row -->
     <div class="platform-row" id="platformRowUpwork">
       <div class="platform-info">
         <span class="platform-badge platform-upwork">UW</span>
@@ -68,7 +67,6 @@
       </div>
     </div>
 
-    <!-- Freelancer row -->
     <div class="platform-row" id="platformRowFreelancer">
       <div class="platform-info">
         <span class="platform-badge platform-freelancer">FL</span>
@@ -90,22 +88,18 @@
     <div id="connectMsg" class="msg hidden"></div>
   </div>
 
-  <!-- ── Section 3: Project Scraping ── -->
+  <!-- ── Project Scraping ── -->
   <div class="section">
-    <div class="section-title">
-      <span class="section-icon">🔍</span> Project Scraping
-    </div>
+    <div class="section-title">Project Scraping</div>
 
-    <!-- Keyword Tags -->
     <div class="field" style="position:relative;">
       <label class="label">Keywords</label>
       <div class="keyword-tags-box" id="keywordTagsBox">
-        <input type="text" id="keywordInput" class="keyword-input" placeholder="Type to add keyword..." autocomplete="off" />
+        <input type="text" id="keywordInput" class="keyword-input" placeholder="Add keyword..." autocomplete="off" />
       </div>
       <div id="suggestionsBox" class="suggestions-box hidden"></div>
     </div>
 
-    <!-- Filters -->
     <div class="field">
       <label class="label">Filters</label>
       <div class="filters-toggles">
@@ -131,24 +125,22 @@
       </div>
     </div>
 
-    <!-- Platform -->
     <div class="field">
       <label class="label">Platform</label>
       <div class="platform-toggle-row">
         <button type="button" id="toggleUpwork" class="platform-toggle active">
-          <span class="ptoggle-badge platform-upwork">UW</span> Upwork
+          <span class="ptoggle-badge platform-upwork">UW</span>Upwork
         </button>
         <button type="button" id="toggleFreelancer" class="platform-toggle active">
-          <span class="ptoggle-badge platform-freelancer">FL</span> Freelancer
+          <span class="ptoggle-badge platform-freelancer">FL</span>Freelancer
         </button>
       </div>
     </div>
 
-    <!-- Action Buttons -->
     <div class="scrape-btn-row">
-      <button id="btnScrape" class="btn btn-primary btn-scrape-main">🔍 Start Scraping</button>
-      <button id="btnTest" class="btn btn-secondary btn-sm" title="Quick test with 1 keyword">Test</button>
-      <button id="btnSearchProjects" class="btn btn-secondary btn-sm btn-icon" title="Open Find Projects page">🔗</button>
+      <button id="btnScrape" class="btn btn-primary btn-scrape-main">Start Scraping</button>
+      <button id="btnTest" class="btn btn-secondary btn-sm" title="Quick test with first keyword">Test</button>
+      <button id="btnSearchProjects" class="btn btn-secondary btn-sm btn-icon" title="Open Find Projects page">&#8599;</button>
     </div>
 
     <div id="scrapeStatusLine" class="scrape-status">
@@ -160,22 +152,16 @@
     </div>
   </div>
 
-  <!-- ── Section 4: Auto-Scrape Schedule ── -->
-  <div class="section">
-    <div class="section-title">
-      <span class="section-icon">⏰</span> Auto-Scrape Schedule
-    </div>
-
-    <div class="toggle-row" style="margin-top:0; margin-bottom:12px;">
-      <div>
-        <span class="toggle-label">Enable Auto-Scrape</span>
-        <span class="toggle-sub" id="scheduleNextRun">Disabled</span>
-      </div>
+  <!-- ── Auto-Scrape Schedule ── -->
+  <div class="section section-last">
+    <div class="section-title-row">
+      <span class="section-title section-title-inline">Auto-Scrape</span>
       <label class="switch">
         <input type="checkbox" id="autoScrapeToggle" />
         <span class="slider"></span>
       </label>
     </div>
+    <span class="schedule-sub" id="scheduleNextRun">Disabled</span>
 
     <div id="schedulePanel">
       <div class="field">
@@ -192,7 +178,7 @@
       <div class="field">
         <label class="label">Active Days</label>
         <div class="day-checkboxes" id="dayCheckboxes">
-          <!-- Filled by popup.js -->
+          <!-- Populated by popup.js -->
         </div>
       </div>
 

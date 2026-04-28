@@ -246,14 +246,13 @@ router.post('/extension-results', authenticate, async (req: AuthRequest, res: Re
     const plat        = String(platform || 'both').toLowerCase();
     const cacheKey    = `ext-results:${userId}:${plat}:${normalizedQ}`;
 
-    // Apply 24h freshness filter before caching so stale results never reach the UI.
-    const freshProjects = (projects as Array<Record<string, unknown>>)
-      .filter(p => is24hFresh(p.postedAt));
+    // Extension already applies 24-hour freshness via _postedMs before sending.
+    // Store all received projects; do not re-filter by date string (date-only strings
+    // from Freelancer parse to midnight and falsely fail the freshness check).
+    await setCache(cacheKey, projects, 600);
+    console.log(`[extension-results] Stored ${projects.length} project(s) for user ${userId}, query='${normalizedQ}', platform='${plat}'`);
 
-    await setCache(cacheKey, freshProjects, 600);
-    console.log(`[extension-results] Stored ${freshProjects.length}/${projects.length} fresh projects for user ${userId}, query='${normalizedQ}', platform='${plat}'`);
-
-    res.json({ success: true, received: projects.length, fresh: freshProjects.length, platform: plat, query: normalizedQ });
+    res.json({ success: true, received: projects.length, fresh: projects.length, platform: plat, query: normalizedQ });
   } catch (err) {
     next(err);
   }
@@ -373,20 +372,19 @@ router.post('/auto-results', authenticate, async (req: AuthRequest, res: Respons
     const plat   = String(platform || 'both');
     const q      = String(query || '');
 
-    // Server-side 24-hour freshness guard — rejects stale projects the extension
-    // may have forwarded before client-side filtering was in place.
-    const receivedCount = projects.length;
-    const freshProjects = (projects as Array<Record<string, unknown>>)
-      .filter(p => is24hFresh(p.postedAt));
-    const staleDropped = receivedCount - freshProjects.length;
+    // Extension already applies strict 24-hour freshness via _postedMs before sending.
+    // Do NOT re-filter here — Freelancer's date-only postedAt string ("Apr 27, 2026")
+    // parses to midnight UTC and falsely fails the 24-hour check for same-day projects.
+    const receivedCount  = projects.length;
+    const allProjects    = projects as Array<Record<string, unknown>>;
 
-    console.log(`[auto-results] Received ${receivedCount} from extension for user ${userId}, query "${q}" on ${plat}${staleDropped > 0 ? ` (dropped ${staleDropped} stale)` : ''}`);
+    console.log(`[auto-results] Received ${receivedCount} project(s) from extension for user ${userId}, query "${q}" on ${plat}`);
 
     // Store as a run log entry in Redis (list, capped at 50 entries)
     const logKey  = `auto-log:${userId}`;
     const entry   = JSON.stringify({
       ts, platform: plat, query: q,
-      received: receivedCount, fresh: freshProjects.length,
+      received: receivedCount, fresh: receivedCount, // extension pre-filtered
       source: source || 'extension',
     });
     await import('../lib/redis').then(({ redis }) => {
@@ -400,7 +398,7 @@ router.post('/auto-results', authenticate, async (req: AuthRequest, res: Respons
     const projKey  = `auto-projects:${userId}`;
     const existing = await getCache<unknown[]>(projKey) ?? [];
     const existingIds = new Set((existing as Array<Record<string, unknown>>).map(p => p.id as string));
-    const newOnes  = freshProjects.filter(p => !existingIds.has(p.id as string));
+    const newOnes  = allProjects.filter(p => !existingIds.has(p.id as string));
     // Merge: new unique projects at front, keep existing up to 500 total
     const merged   = [...newOnes, ...existing].slice(0, 500);
     await setCache(projKey, merged, 60 * 60 * 24); // 24-hour TTL
@@ -434,10 +432,11 @@ router.post('/auto-results', authenticate, async (req: AuthRequest, res: Respons
       console.log(`[auto-results] Saved ${dbSaved} new project(s) to DB for user ${userId}`);
     }
 
+    console.log(`[auto-results] Stored ${newOnes.length} new / ${existing.length} existing for user ${userId}`);
     res.json({
       success: true,
       received: receivedCount,
-      fresh: freshProjects.length,
+      fresh: receivedCount,
       stored: newOnes.length,
       dbSaved,
     });
