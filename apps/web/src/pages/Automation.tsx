@@ -303,17 +303,25 @@ export default function Automation() {
   }, []);
 
   // ── Load initial extension state once the extension is detected ────────────
+  // Also request state periodically to catch any missed updates
 
   useEffect(() => {
     if (!extensionInstalled) return;
     window.dispatchEvent(new CustomEvent('FOS_GET_EXT_STATE'));
+    // Reinitialize state every 5s to catch any missed updates from extension
+    const interval = setInterval(() => {
+      window.dispatchEvent(new CustomEvent('FOS_GET_EXT_STATE'));
+    }, 5000);
+    return () => clearInterval(interval);
   }, [extensionInstalled]);
 
   // ── Apply extension state (used for both initial load and delta updates) ───
+  // When extension is installed, ALL state comes from extension — page is read-only
 
   const applyExtState = useCallback((state: ExtState) => {
     isUpdatingFromExtRef.current = true;
 
+    // Always apply extension state when it arrives
     if (typeof state.autoScrape === 'boolean') {
       setEnabled(state.autoScrape);
     }
@@ -372,6 +380,7 @@ export default function Automation() {
   }, [config.platform]);
 
   // ── Push config changes back to extension (debounced, skip loop) ──────────
+  // When extension is installed, only sync if the change didn't come FROM the extension
 
   useEffect(() => {
     if (!extensionInstalled || isUpdatingFromExtRef.current) return;
@@ -381,6 +390,10 @@ export default function Automation() {
       window.dispatchEvent(new CustomEvent('FOS_SET_EXT_STATE', {
         detail: configToExtState(config),
       }));
+      // After pushing config, request fresh state to ensure sync
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('FOS_GET_EXT_STATE'));
+      }, 300);
     }, 600);
     return () => { if (configSyncTimerRef.current) clearTimeout(configSyncTimerRef.current); };
   }, [config, extensionInstalled]);
@@ -414,28 +427,40 @@ export default function Automation() {
         setTimeout(() => {
           queryClient.invalidateQueries({ queryKey: ['automation-auto-results'] });
         }, 2000);
+        // Also refresh extension state to get latest counts
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('FOS_GET_EXT_STATE'));
+        }, 2500);
       }
     }
     window.addEventListener('FOS_SCRAPE_EVENT', onScrapeEvent);
     return () => window.removeEventListener('FOS_SCRAPE_EVENT', onScrapeEvent);
-  }, [addLog]);
+  }, [addLog, queryClient]);
 
   // ── Auto-results polling ──────────────────────────────────────────────────
   // Poll whenever the page thinks automation is active. With extension sync,
   // `enabled` mirrors the extension's autoScrape flag — so polling runs
   // automatically when the extension is running, even after a page refresh.
+  // Also poll when extension is installed to catch any scrapes (manual, auto, or test).
 
   // Poll whenever automation is enabled OR the extension is installed.
   // Extension-installed mode polls passively so results from any scrape
   // (manual popup scrape, auto alarm, Test Now) appear without `enabled` being true.
   const isPollingActive = enabled || extensionInstalled;
-  const { data: autoResultsData } = useQuery({
+  const { data: autoResultsData, refetch: refetchAutoResults } = useQuery({
     queryKey:        ['automation-auto-results'],
     queryFn:         scraperApi.getAutoResults,
     enabled:         isPollingActive,
     refetchInterval: isPollingActive ? 10_000 : false,
     staleTime:       0,
   });
+
+  // Ensure polling is active when extension is detected
+  useEffect(() => {
+    if (extensionInstalled && isPollingActive) {
+      refetchAutoResults();
+    }
+  }, [extensionInstalled, isPollingActive, refetchAutoResults]);
 
   useEffect(() => {
     if (!autoResultsData) return;
@@ -639,6 +664,8 @@ export default function Automation() {
   }, [enabled, config.intervalMinutes, extensionInstalled]);
 
   // ── Config helpers ─────────────────────────────────────────────────────────
+  // When extension is installed, config changes are synced to extension automatically.
+  // The page is read-only for extension-controlled settings.
 
   function setField<K extends keyof AutomationConfig>(key: K, value: AutomationConfig[K]) {
     setConfig(prev => ({ ...prev, [key]: value }));
@@ -673,11 +700,15 @@ export default function Automation() {
     const next = !enabled;
     setEnabled(next);
 
-    // Sync toggle back to extension
+    // Sync toggle back to extension immediately
     if (extensionInstalled) {
       window.dispatchEvent(new CustomEvent('FOS_SET_EXT_STATE', {
         detail: { autoScrape: next },
       }));
+      // Request fresh state after toggle to ensure sync
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('FOS_GET_EXT_STATE'));
+      }, 300);
     }
 
     if (next) addLog('Automation enabled', 'success');

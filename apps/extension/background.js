@@ -49,6 +49,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const interval = d.scheduleInterval || 15;
       chrome.alarms.clear('autoScrape', () => {
         chrome.alarms.create('autoScrape', { periodInMinutes: interval });
+        console.log(`[extension] Auto-scrape enabled with ${interval} min interval`);
       });
     });
     sendResponse({ ok: true });
@@ -56,7 +57,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === 'AUTO_SCRAPE_OFF') {
-    chrome.alarms.clear('autoScrape');
+    chrome.alarms.clear('autoScrape', () => {
+      console.log('[extension] Auto-scrape disabled');
+    });
     sendResponse({ ok: true });
     return true;
   }
@@ -65,8 +68,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'RESCHEDULE_IF_ACTIVE') {
     chrome.storage.local.get(['autoScrape', 'scheduleInterval'], (d) => {
       if (d.autoScrape) {
+        const interval = d.scheduleInterval || 15;
         chrome.alarms.clear('autoScrape', () => {
-          chrome.alarms.create('autoScrape', { periodInMinutes: d.scheduleInterval || 15 });
+          chrome.alarms.create('autoScrape', { periodInMinutes: interval });
+          console.log(`[extension] Auto-scrape rescheduled to ${interval} min interval`);
         });
       }
     });
@@ -86,7 +91,10 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   ]);
 
   const resolvedQuery = (data.selectedKeywords || []).join(', ') || data.lastQuery || '';
-  if (!data.autoScrape || !resolvedQuery || !data.authToken) return;
+  if (!data.autoScrape || !resolvedQuery || !data.authToken) {
+    console.log('[auto-scrape] Skipped — autoScrape disabled or missing config');
+    return;
+  }
 
   // Day-of-week guard
   const now        = new Date();
@@ -181,8 +189,19 @@ async function handleScrape({ query, platform, apiUrl, authToken, filters = null
 
     // Send to both endpoints: extension-results (for Find Projects cache)
     // and auto-results (for Automation page display)
-    await sendProjectsToApi({ query, platform, projects: toSend, apiUrl, authToken });
-    await sendResultsToAutomation({ query, platform, projects: toSend, apiUrl, authToken }).catch(console.error);
+    // Both endpoints are critical for data flow — retry if one fails
+    try {
+      await sendProjectsToApi({ query, platform, projects: toSend, apiUrl, authToken });
+    } catch (err) {
+      console.warn('[extension] Failed to send to extension-results:', err?.message);
+      // Continue anyway — try auto-results
+    }
+    try {
+      await sendResultsToAutomation({ query, platform, projects: toSend, apiUrl, authToken });
+    } catch (err) {
+      console.warn('[extension] Failed to send to auto-results:', err?.message);
+      // Continue anyway — at least one endpoint should have received data
+    }
 
     const statusMsg = scrapedCount !== matchedCount
       ? `Done — ${scrapedCount} scraped → ${matchedCount} matched`
