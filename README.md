@@ -14,6 +14,7 @@ Purpose: provide a reproducible local development environment and reference for 
 - Browser scraper (Python): [apps/scraper](apps/scraper)
 - Chrome extension: [apps/extension](apps/extension)
 - Shared packages: [packages](packages)
+- Architecture visual: [architecture.html](architecture.html)
 
 -----
 
@@ -24,7 +25,7 @@ Purpose: provide a reproducible local development environment and reference for 
 - Scraper (Python Playwright) supports complex browser sessions and can be invoked from the API.
 - Redis is used for short-term caches and automation state.
 
-See [architecture.html](architecture.html) for a diagram and sequence flow.
+<!-- architecture.html removed -->
 
 -----
 
