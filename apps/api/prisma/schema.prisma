@@ -11,10 +11,11 @@ model User {
   id        String   @id @default(cuid())
   email     String   @unique
   name      String
-  password  String?
-  avatarUrl String?
-  googleId  String?  @unique
-  timezone  String   @default("UTC")
+  password       String?
+  avatarUrl      String?
+  googleId       String?  @unique
+  timezone       String   @default("UTC")
+  emailVerified  Boolean  @default(true)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

@@ -4,12 +4,10 @@ import { Link, useNavigate } from 'react-router-dom';
 import { Zap, UserPlus } from 'lucide-react';
 import { SignupSchema, type SignupInput } from '@freelancer-os/shared';
 import { authApi } from '../../lib/api';
-import { useAuthStore } from '../../store/authStore';
 import { useState } from 'react';
 
 export default function Signup() {
   const navigate = useNavigate();
-  const login = useAuthStore((s) => s.login);
   const [serverError, setServerError] = useState('');
 
   const { register, handleSubmit, formState: { errors, isSubmitting } } = useForm<SignupInput>({
@@ -19,19 +17,25 @@ export default function Signup() {
   async function onSubmit(data: SignupInput) {
     setServerError('');
     try {
-      const res = await authApi.signup(data);
-      login(res.user, res.accessToken, res.refreshToken);
-      navigate('/');
+      await authApi.signup(data);
+      navigate(`/verify-email?email=${encodeURIComponent(data.email)}&purpose=verify`);
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setServerError(msg || 'Signup failed. Please try again.');
+      const axiosErr = err as { response?: { status?: number; data?: { error?: string; requiresVerification?: boolean; email?: string } } };
+      const body = axiosErr?.response?.data;
+
+      // Unverified duplicate — send them to verify
+      if (axiosErr?.response?.status === 409 && body?.requiresVerification) {
+        navigate(`/verify-email?email=${encodeURIComponent(body.email || data.email)}&purpose=verify`);
+        return;
+      }
+
+      setServerError(body?.error || 'Signup failed. Please try again.');
     }
   }
 
   return (
     <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
       <div className="w-full max-w-md">
-        {/* Logo */}
         <div className="flex items-center justify-center gap-3 mb-8">
           <div className="w-10 h-10 bg-primary rounded-xl flex items-center justify-center">
             <Zap size={20} className="text-white" />

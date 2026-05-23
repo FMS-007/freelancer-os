@@ -71,8 +71,11 @@ api.interceptors.response.use(
     const status   = error.response?.status;
     const url: string = original?.url ?? '';
 
-    // 429 Too Many Requests: honour Retry-After header, then replay once
-    if (status === 429 && !original._retry429) {
+    // 429 Too Many Requests: replay once only for non-auth idempotent requests.
+    const method = String(original?.method || 'get').toLowerCase();
+    const isAuthCall = url.includes('/auth/');
+    const canRetry429 = method === 'get' && !isAuthCall;
+    if (status === 429 && !original._retry429 && canRetry429) {
       original._retry429 = true;
       const retryAfter = parseInt(error.response?.headers?.['retry-after'] || '3', 10);
       await sleep(Math.max(retryAfter, 2) * 1000);
@@ -87,7 +90,12 @@ api.interceptors.response.use(
       const isPublicAuthCall =
         url.includes('/auth/refresh') ||
         url.includes('/auth/login')   ||
-        url.includes('/auth/signup');
+        url.includes('/auth/signup')  ||
+        url.includes('/auth/verify-email') ||
+        url.includes('/auth/resend-otp') ||
+        url.includes('/auth/forgot-password') ||
+        url.includes('/auth/verify-reset-otp') ||
+        url.includes('/auth/reset-password');
 
       if (isPublicAuthCall) {
         useAuthStore.getState().logout();
@@ -126,6 +134,16 @@ export const authApi = {
     api.post('/auth/login', data).then(r => r.data),
   logout: () => api.post('/auth/logout').then(r => r.data),
   me:     () => api.get('/auth/me').then(r => r.data),
+  verifyEmail: (data: { email: string; otp: string }) =>
+    api.post('/auth/verify-email', data).then(r => r.data),
+  resendOtp: (data: { email: string; purpose: 'verify' | 'reset' }) =>
+    api.post('/auth/resend-otp', data).then(r => r.data),
+  forgotPassword: (data: { email: string }) =>
+    api.post('/auth/forgot-password', data).then(r => r.data),
+  verifyResetOtp: (data: { email: string; otp: string }) =>
+    api.post('/auth/verify-reset-otp', data).then(r => r.data),
+  resetPassword: (data: { resetToken: string; newPassword: string }) =>
+    api.post('/auth/reset-password', data).then(r => r.data),
   /** Generate a 30-day token for use in the Freelancer OS Chrome Extension. */
   extensionToken: () =>
     api.post<{ extensionToken: string; expiresIn: string }>('/auth/extension-token').then(r => r.data),

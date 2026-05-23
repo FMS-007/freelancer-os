@@ -6,8 +6,11 @@ import { isFirebaseConfigured, registerPushNotifications } from '../lib/firebase
 import {
   Shield, Bell, Database, Trash2, Download,
   Key, Check, AlertTriangle, RefreshCw, Copy, Puzzle,
+  Mic, MicOff,
 } from 'lucide-react';
 import clsx from 'clsx';
+import { useVoiceAssistantStore } from '../store/voiceAssistantStore';
+import { useVoiceAssistant } from '../context/VoiceAssistantContext';
 
 export default function Settings() {
   const { user, logout } = useAuthStore();
@@ -32,6 +35,12 @@ export default function Settings() {
   // Delete account
   const [deleteConfirm, setDeleteConfirm] = useState('');
   const [deleting, setDeleting] = useState(false);
+
+  // Voice assistant
+  const voiceEnabled = useVoiceAssistantStore((s) => s.isEnabled);
+  const voiceListening = useVoiceAssistantStore((s) => s.isListening);
+  const setVoiceEnabled = useVoiceAssistantStore((s) => s.setEnabled);
+  const { isSupported: voiceSupported } = useVoiceAssistant();
 
   async function handleChangePassword() {
     if (pwForm.next !== pwForm.confirm) {
@@ -206,6 +215,95 @@ export default function Settings() {
                 Permission denied. Enable notifications in your browser settings.
               </p>
             )}
+          </div>
+        </div>
+
+        {/* ARIA Voice Assistant */}
+        <div className="card p-5">
+          <h2 className="font-semibold text-dark mb-1 flex items-center gap-2">
+            <Mic size={16} className="text-primary" /> ARIA Voice Assistant
+          </h2>
+          <p className="text-sm text-slate-500 mb-4">
+            AI-powered voice operating layer for FreelancerOS. Speak naturally to navigate,
+            search, run automation, open projects, and control every part of the platform
+            hands-free. ARIA responds with voice and executes your commands in real time.
+            {!voiceSupported && (
+              <span className="block mt-1 text-xs text-warning">
+                Your browser does not support the Web Speech API. Use Chrome or Edge for full support.
+              </span>
+            )}
+          </p>
+
+          {/* Enable toggle + live status */}
+          <div className="flex items-center gap-4 flex-wrap mb-4">
+            <button
+              onClick={() => setVoiceEnabled(!voiceEnabled)}
+              disabled={!voiceSupported}
+              className={clsx('btn', voiceEnabled ? 'btn-primary' : 'btn-secondary')}
+            >
+              {voiceEnabled
+                ? <><MicOff size={14} /> Disable ARIA</>
+                : <><Mic size={14} /> Enable ARIA</>}
+            </button>
+            {voiceEnabled && (
+              <span className="flex items-center gap-2 text-sm font-medium text-success">
+                <span className="va-active-dot" />
+                {voiceListening ? 'Listening…' : 'Active — watching the bottom-right corner'}
+              </span>
+            )}
+          </div>
+
+          {/* Anthropic API key (optional — unlocks full AI intelligence) */}
+          <div className="space-y-1 mb-4">
+            <label className="label flex items-center gap-1.5">
+              <Key size={12} className="text-primary" />
+              Anthropic API Key
+              <span className="badge badge-blue text-[10px] px-1.5 py-0 ml-1">Optional — AI Mode</span>
+            </label>
+            <input
+              type="password"
+              className="input font-mono text-xs"
+              placeholder="sk-ant-api03-…  (enables full Claude AI understanding)"
+              defaultValue=""
+              onChange={(e) => {
+                // Store in sessionStorage only — never sent to backend
+                if (e.target.value.trim()) {
+                  sessionStorage.setItem('__aria_key', e.target.value.trim());
+                } else {
+                  sessionStorage.removeItem('__aria_key');
+                }
+              }}
+            />
+            <p className="text-xs text-slate-400">
+              Without a key, ARIA uses a fast built-in intent engine.
+              Add your{' '}
+              <span className="font-medium text-dark">Anthropic API key</span>{' '}
+              to unlock full Claude AI — contextual understanding, chained commands, and
+              natural conversation. The key is stored in session memory only and never leaves your browser.
+            </p>
+          </div>
+
+          {/* Example commands — always visible */}
+          <div className="rounded-lg border border-blue-200 bg-blue-50 p-3">
+            <p className="text-xs font-semibold text-primary mb-2">Example commands</p>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs text-slate-600">
+              <span>"Go to dashboard"</span>
+              <span>"Turn on automation"</span>
+              <span>"Search React projects"</span>
+              <span>"Find AI jobs under $500"</span>
+              <span>"Open the second project"</span>
+              <span>"Apply hourly filter"</span>
+              <span>"Go to analytics"</span>
+              <span>"Scroll down"</span>
+              <span>"Turn off automation"</span>
+              <span>"Go to settings"</span>
+              <span>"Refresh this page"</span>
+              <span>"Sign out"</span>
+            </div>
+            <p className="text-xs text-slate-400 mt-2">
+              With AI mode: chained commands like{' '}
+              <em>"Search Python jobs and open the top result"</em> work too.
+            </p>
           </div>
         </div>
 

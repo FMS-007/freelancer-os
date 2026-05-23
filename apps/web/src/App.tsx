@@ -5,6 +5,9 @@ import { useAuthStore } from './store/authStore';
 import Layout from './components/layout/Layout';
 import Login from './pages/auth/Login';
 import Signup from './pages/auth/Signup';
+import VerifyOTP from './pages/auth/VerifyOTP';
+import ForgotPassword from './pages/auth/ForgotPassword';
+import ResetPassword from './pages/auth/ResetPassword';
 import Dashboard from './pages/Dashboard';
 import Templates from './pages/Templates';
 import AIAnalyze from './pages/AIAnalyze';
@@ -35,6 +38,13 @@ function AuthInitializer({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (ready) return;
+
+    const publicAuthPaths = ['/login', '/signup', '/verify-email', '/forgot-password', '/reset-password'];
+    if (publicAuthPaths.includes(window.location.pathname)) {
+      logout();
+      setReady(true);
+      return;
+    }
 
     if (!refreshToken) {
       logout();
@@ -89,6 +99,9 @@ export default function App() {
           {/* Public */}
           <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
           <Route path="/signup" element={<PublicRoute><Signup /></PublicRoute>} />
+          <Route path="/verify-email" element={<VerifyOTP />} />
+          <Route path="/forgot-password" element={<ForgotPassword />} />
+          <Route path="/reset-password" element={<ResetPassword />} />
 
           {/* Protected */}
           <Route path="/" element={<PrivateRoute><Layout /></PrivateRoute>}>

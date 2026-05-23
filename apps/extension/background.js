@@ -20,7 +20,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.type === 'SCRAPE') {
     chrome.storage.local.get(
-      ['apiUrl', 'authToken', 'selectedKeywords', 'lastPlatform', 'scrapeFilters'],
+      ['apiUrl', 'authToken', 'selectedKeywords', 'selectedTechStack', 'lastPlatform', 'scrapeFilters'],
     ).then((stored) => {
       const apiUrl    = msg.apiUrl    || stored.apiUrl    || 'http://localhost:3001';
       const authToken = msg.authToken || stored.authToken || '';
@@ -36,12 +36,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         chrome.runtime.sendMessage({ type: 'SCRAPE_DONE', error: 'No keywords configured.' }).catch(() => {});
         return;
       }
-      // Use caller-supplied filters first, then stored filters as fallback
+      // Use caller-supplied filters and tech stack first, then stored as fallback
       const filters  = msg.filters  || stored.scrapeFilters || null;
-      handleScrape({ query, platform, apiUrl, authToken, filters }).catch(console.error);
+      const techStack = msg.techStack || stored.selectedTechStack || [];
+      handleScrape({ query, platform, apiUrl, authToken, filters, techStack }).catch(console.error);
     });
     sendResponse({ started: true });
-    return true;
+    return false;
   }
 
   if (msg.type === 'AUTO_SCRAPE_ON') {
@@ -52,8 +53,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         console.log(`[extension] Auto-scrape enabled with ${interval} min interval`);
       });
     });
+    // Trigger one immediate cycle so users see results right after enabling automation.
+    runAutoScrapeCycle('manual-enable').catch(console.error);
     sendResponse({ ok: true });
-    return true;
+    return false;
   }
 
   if (msg.type === 'AUTO_SCRAPE_OFF') {
@@ -61,7 +64,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       console.log('[extension] Auto-scrape disabled');
     });
     sendResponse({ ok: true });
-    return true;
+    return false;
   }
 
   // Restart alarm with updated interval (called when schedule config changes from web app)
@@ -76,7 +79,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       }
     });
     sendResponse({ ok: true });
-    return true;
+    return false;
   }
 });
 
@@ -85,47 +88,68 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name !== 'autoScrape') return;
 
+  await runAutoScrapeCycle('alarm');
+});
+
+async function runAutoScrapeCycle(trigger = 'alarm') {
+
   const data = await chrome.storage.local.get([
     'lastQuery', 'lastPlatform', 'apiUrl', 'authToken', 'autoScrape',
-    'scheduleDays', 'scheduleStartHour', 'scheduleEndHour', 'scrapeFilters', 'selectedKeywords',
+    'scheduleDays', 'scheduleStartHour', 'scheduleEndHour', 'scrapeFilters', 'selectedKeywords', 'selectedTechStack',
   ]);
 
   const resolvedQuery = (data.selectedKeywords || []).join(', ') || data.lastQuery || '';
   if (!data.autoScrape || !resolvedQuery || !data.authToken) {
     console.log('[auto-scrape] Skipped — autoScrape disabled or missing config');
+    if (data.autoScrape) {
+      const status = !resolvedQuery
+        ? 'Auto-scrape skipped: add at least one keyword in extension settings.'
+        : 'Auto-scrape skipped: missing auth token in extension settings.';
+      chrome.storage.local.set({ scrapeStatus: status });
+      chrome.runtime.sendMessage({ type: 'SCRAPE_STATUS', message: status }).catch(() => {});
+    }
     return;
   }
 
-  // Day-of-week guard
+  const enforceScheduleWindow = trigger === 'alarm';
+
+  // Day-of-week guard (enforced only for alarm-driven runs)
   const now        = new Date();
   const todayIndex = now.getDay();
   const activeDays = data.scheduleDays ?? [1, 2, 3, 4, 5];
-  if (!activeDays.includes(todayIndex)) {
+  if (enforceScheduleWindow && !activeDays.includes(todayIndex)) {
     console.log('[auto-scrape] Skipped — today not in scheduled days');
+    const status = 'Auto-scrape skipped: today is not enabled in schedule days.';
+    chrome.storage.local.set({ scrapeStatus: status });
+    chrome.runtime.sendMessage({ type: 'SCRAPE_STATUS', message: status }).catch(() => {});
     return;
   }
 
-  // Hour-range guard
+  // Hour-range guard (enforced only for alarm-driven runs)
   const startHour = data.scheduleStartHour ?? 9;
   const endHour   = data.scheduleEndHour   ?? 18;
-  if (now.getHours() < startHour || now.getHours() >= endHour) {
+  if (enforceScheduleWindow && (now.getHours() < startHour || now.getHours() >= endHour)) {
     console.log(`[auto-scrape] Skipped — outside window ${startHour}:00–${endHour}:00`);
+    const status = `Auto-scrape skipped: outside schedule window ${startHour}:00-${endHour}:00.`;
+    chrome.storage.local.set({ scrapeStatus: status });
+    chrome.runtime.sendMessage({ type: 'SCRAPE_STATUS', message: status }).catch(() => {});
     return;
   }
 
-  console.log(`[auto-scrape] Running at ${now.toLocaleTimeString()} for "${resolvedQuery}" on ${data.lastPlatform || 'both'}`);
+  console.log(`[auto-scrape] Running (${trigger}) at ${now.toLocaleTimeString()} for "${resolvedQuery}" on ${data.lastPlatform || 'both'}`);
   await handleScrape({
     query:     resolvedQuery,
     platform:  data.lastPlatform || 'both',
     apiUrl:    data.apiUrl    || 'http://localhost:3001',
     authToken: data.authToken,
     filters:   data.scrapeFilters || null,
+    techStack: data.selectedTechStack || [],
   }).catch(console.error);
-});
+}
 
 // ── Main scrape orchestrator ──────────────────────────────────────────────────
 
-async function handleScrape({ query, platform, apiUrl, authToken, filters = null }) {
+async function handleScrape({ query, platform, apiUrl, authToken, filters = null, techStack = [] }) {
   startKeepAlive();
 
   const notify = (message) => {
@@ -177,8 +201,8 @@ async function handleScrape({ query, platform, apiUrl, authToken, filters = null
       console.log(`[extension] Dropped ${staleDropped} project(s) (no timestamp or older than 24 h)`);
     }
 
-    // ── Criteria filtering (keywords + verification + ratings) ────────────────
-    const matchedProjects = applyFilters(freshProjects, filters, uniqueKws);
+    // ── Criteria filtering (keywords + verification + ratings + tech stack) ────
+    const matchedProjects = applyFilters(freshProjects, filters, uniqueKws, techStack);
     const matchedCount    = matchedProjects.length;
     console.log(`[extension] ${scrapedCount} scraped → ${freshProjects.length} fresh → ${matchedCount} matched`);
 
@@ -230,28 +254,51 @@ async function handleScrape({ query, platform, apiUrl, authToken, filters = null
 }
 
 // ── Filter projects ───────────────────────────────────────────────────────────
-// keywords : string[] — at least one must appear in title+description (OR)
-// filters  : { paymentVerified, profileVerified, depositMade, minReviews, minRating }
-// Verification booleans: only reject if the field is explicitly false
-//   (null/undefined = platform doesn't expose it = pass through)
-// Numeric thresholds: only reject when the platform supplies the value AND it fails
+// STRICT FILTERING: A project passes only if it matches ALL selected criteria.
 
-function applyFilters(projects, filters, keywords) {
+// Normalize tech name: strip dots, spaces, dashes, #, + so "node.js" == "nodejs"
+function _normTech(s) {
+  return s.toLowerCase().replace(/[.\s\-+#]/g, '');
+}
+
+// Whole-word regex: prevents "React" from matching "Proactive" or "node" from "standalone"
+function _techWordRe(tech) {
+  const escaped = tech.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('(?:^|[^a-z0-9])' + escaped + '(?:[^a-z0-9]|$)', 'i');
+}
+
+function applyFilters(projects, filters, keywords, techStack = []) {
   return projects.filter(p => {
-    // 1. Keyword match — at least one keyword must appear in title or description
+    // 1. MAIN QUERY KEYWORDS (OR: at least one must appear as a whole word)
     if (keywords && keywords.length > 0) {
-      const text = ((p.title || '') + ' ' + (p.description || '')).toLowerCase();
-      if (!keywords.some(k => text.includes(k.toLowerCase()))) return false;
+      const text = ((p.title || '') + ' ' + (p.description || ''));
+      const hasKeyword = keywords.some(k => _techWordRe(k).test(text));
+      if (!hasKeyword) return false;
+    }
+
+    // 2. TECH STACK (AND: ALL selected techs must be present)
+    if (techStack && techStack.length > 0) {
+      const skillSet = (p.skills ?? []).map(s => _normTech(s));
+      const text     = ((p.title || '') + ' ' + (p.description || ''));
+
+      const hasAllTechs = techStack.every(t => {
+        const tNorm = _normTech(t);
+        // First try normalised exact match in skills list
+        if (skillSet.some(s => s === tNorm || s.includes(tNorm))) return true;
+        // Fall back to whole-word match in title/description
+        return _techWordRe(t).test(text);
+      });
+      if (!hasAllTechs) return false;
     }
 
     if (!filters) return true;
 
-    // 2. Boolean verification flags
+    // 3. VERIFICATION FLAGS (AND: all selected must be true)
     if (filters.paymentVerified && p.paymentVerified === false) return false;
     if (filters.profileVerified && p.identityVerified === false) return false;
-    if (filters.depositMade     && p.depositMade === false)      return false;
+    if (filters.depositMade     && p.depositMade      === false) return false;
 
-    // 3. Numeric thresholds (pass when platform doesn't provide the data)
+    // 4. NUMERIC THRESHOLDS (AND: all must pass when platform supplies the value)
     if (filters.minReviews > 0 && p.clientReviewCount != null && p.clientReviewCount < filters.minReviews) return false;
     if (filters.minRating  > 0 && p.clientRating      != null && p.clientRating      < filters.minRating)  return false;
 
@@ -280,6 +327,9 @@ async function sendResultsToAutomation({ query, platform, projects, apiUrl, auth
     headers: { Authorization: `Bearer ${authToken}`, 'Content-Type': 'application/json' },
     body:    JSON.stringify({ query, platform, projects, source: 'extension' }),
   });
-  if (!resp.ok) return;
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.error || `auto-results API ${resp.status}`);
+  }
   return resp.json();
 }

@@ -1,110 +1,150 @@
 # Freelancer OS
 
-Freelancer OS is a monorepo for freelancer workflow automation.
+A monorepo that automates freelance project discovery, filtering, and proposal workflows.
+This repository contains a browser extension (scraper), backend API, and a React dashboard.
 
-## What’s inside
+Purpose: provide a reproducible local development environment and reference for contributors and maintainers.
 
-- `apps/web`: React + Vite dashboard for proposals, templates, analytics, alerts, records, profile, and settings
-- `apps/api`: Express + Prisma API for auth, persistence, business logic, and scheduled jobs
-- `apps/scraper`: FastAPI + Playwright Python service for browser-based scraping and account connection flows
-- `packages/shared`: shared types, schemas, and constants
-- `packages/ui`: reusable UI components
+-----
 
-## Tech Stack
+## Quick links
 
-- pnpm workspaces
-- Turbo
-- React 18, Vite, Tailwind CSS
-- Express, Prisma, Redis, JWT
-- FastAPI, Playwright, httpx
+- Dashboard / frontend: [apps/web](apps/web)
+- API server: [apps/api](apps/api)
+- Browser scraper (Python): [apps/scraper](apps/scraper)
+- Chrome extension: [apps/extension](apps/extension)
+- Shared packages: [packages](packages)
+- Architecture visual: [architecture.html](architecture.html)
 
-## Prerequisites
+-----
 
-- Node.js 20+ recommended
-- pnpm
-- Python 3.11+ for the scraper service
-- PostgreSQL
-- Redis
+## Architecture (high level)
 
-## Setup
+- Extension scrapes projects and sends results to the API.
+- API applies filtering, deduplication, stores projects via Prisma (Postgres), and publishes automation state.
+- Scraper (Python Playwright) supports complex browser sessions and can be invoked from the API.
+- Redis is used for short-term caches and automation state.
 
-1. Install dependencies:
+See [architecture.html](architecture.html) for a diagram and sequence flow.
+
+-----
+
+## Fast start (recommended)
+
+Prerequisites: Node.js 20+, pnpm, Docker (for Postgres/Redis), Python 3.11+ if you run the scraper locally.
+
+1) Start local infra (Postgres + Redis) with Docker Compose:
+
+```bash
+docker compose up -d
+```
+
+2) Install JS deps:
 
 ```bash
 pnpm install
 ```
 
-2. Create your environment file:
+3) Copy env and populate values:
 
 ```bash
 cp .env.example .env
+# edit .env (DATABASE_URL, REDIS_URL, JWT secrets)
 ```
 
-3. Fill in the required values in `.env`.
-
-4. Generate Prisma client and apply migrations:
+4) Generate Prisma client and run migrations (API container or locally):
 
 ```bash
 pnpm --filter @freelancer-os/api prisma:generate
-pnpm --filter @freelancer-os/api prisma:migrate
+pnpm --filter @freelancer-os/api prisma:migrate:dev
 ```
 
-## Development
-
-Run all apps:
+5) Run all services for development:
 
 ```bash
 pnpm dev
 ```
 
-Run only the API:
+Individual services:
 
 ```bash
-pnpm dev:api
+pnpm --filter @freelancer-os/api dev
+pnpm --filter @freelancer-os/web dev
+# Python scraper (optional)
+python -m venv .venv && .venv\Scripts\activate; pip install -r apps/scraper/requirements.txt
+python apps/scraper/api.py
 ```
 
-Run only the web app:
+-----
 
-```bash
-pnpm dev:web
+## Configuration / Important environment variables
+
+- `DATABASE_URL` — Postgres connection string used by Prisma.
+- `REDIS_URL` — Redis connection for caching and automation state.
+- `JWT_SECRET`, `JWT_REFRESH_SECRET` — auth tokens.
+- `CORS_ORIGIN` — frontend origin for local dev.
+- `SCRAPER_URL` — endpoint for the Playwright scraper (when run separately).
+
+Additional provider keys (only for optional integrations): `AWS_*`, `GOOGLE_CLIENT_*`, `FIREBASE_SERVICE_ACCOUNT`, `OPENAI_API_KEY`.
+
+-----
+
+## Backups & DB
+
+Local DB is managed in Docker Compose. To export a plain SQL dump (works on Windows):
+
+```powershell
+# inside project root
+docker exec freelancer_postgres sh -c "pg_dump -U freelancer freelancer_db -F p -f /tmp/freelancer_db.sql"
+docker cp freelancer_postgres:/tmp/freelancer_db.sql ./backups/freelancer_db.sql
 ```
 
-## Build
+Keep `backups/` if you need saved dumps — do not delete without verifying.
 
-```bash
-pnpm build
-```
+-----
 
-## Useful Commands
+## Tools / scripts
 
-- `pnpm lint`
-- `pnpm typecheck`
-- `pnpm --filter @freelancer-os/api prisma:studio`
+- `pnpm dev` — start dev mode for all workspaces (concurrently).
+- `pnpm build` — build all packages.
+- `pnpm lint` — run linters.
+- `pnpm typecheck` — run TypeScript checks.
+- Prisma commands are available under the `@freelancer-os/api` package filters.
 
-## Environment
+See `package.json` and workspace scripts for exact commands.
 
-The main app expects variables such as:
+-----
 
-- `DATABASE_URL`
-- `REDIS_URL`
-- `JWT_SECRET`
-- `JWT_REFRESH_SECRET`
-- `CORS_ORIGIN`
-- `SCRAPER_URL`
+## Testing & QA
 
-Optional integrations may also use:
+- Unit and integration tests are colocated per package (add tests under `apps/*/tests` or `packages/*/tests`).
+- Run tests with your preferred runner; CI should run `pnpm install && pnpm build && pnpm test`.
 
-- `GROQ_API_KEY`
-- `GOOGLE_CLIENT_ID`
-- `GOOGLE_CLIENT_SECRET`
-- `AWS_*`
-- `FIREBASE_SERVICE_ACCOUNT`
+-----
 
-## Notes
+## Common troubleshooting
 
-- The scraper service has its own Python dependencies in `apps/scraper/requirements.txt`
-- `graphify-out/` contains generated analysis output and is safe to ignore locally
+- If the API can't connect to Postgres, ensure Docker Compose is up and `DATABASE_URL` points to the correct host/port.
+- On Windows, prefer in-container dumps + `docker cp` instead of redirecting `docker exec` output.
+- If scraping fails, check extension cookies and Playwright dependencies for the Python scraper.
 
-## License
+-----
 
-MIT
+## Contributing
+
+1. Create an issue describing the change.
+2. Branch from `main` with `feature/<short-desc>`.
+3. Add tests and keep changes scoped.
+4. Open a PR and assign reviewers.
+
+-----
+
+## Where to look next
+
+- API routes: [apps/api/src/routes](apps/api/src/routes)
+- Extension entry: [apps/extension/background.js](apps/extension/background.js)
+- Schema: [apps/api/prisma/schema.prisma](apps/api/prisma/schema.prisma)
+
+-----
+
+License: MIT

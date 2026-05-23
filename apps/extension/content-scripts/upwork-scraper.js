@@ -22,7 +22,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   } catch (e) {
     sendResponse({ jobs: [], error: e.message });
   }
-  return true;
+  return false;
 });
 
 function extractJobs() {

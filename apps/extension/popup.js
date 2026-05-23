@@ -29,6 +29,8 @@ const connectMsg        = $('connectMsg');
 
 const keywordInput      = $('keywordInput');
 const keywordTagsBox    = $('keywordTagsBox');
+const techStackInput    = $('techStackInput');
+const techStackTagsBox  = $('techStackTagsBox');
 const btnScrape         = $('btnScrape');
 const btnTest           = $('btnTest');
 const scrapeStatusText  = $('scrapeStatusText');
@@ -146,6 +148,59 @@ keywordInput.addEventListener('keydown', (e) => {
 
 keywordTagsBox.addEventListener('click', () => keywordInput.focus());
 
+// ── Tech Stack (tag state) ────────────────────────────────────────────────────
+
+let selectedTechStack = [];
+
+function renderTechStackTags() {
+  Array.from(techStackTagsBox.children).forEach(child => {
+    if (child !== techStackInput) techStackTagsBox.removeChild(child);
+  });
+  selectedTechStack.forEach(tech => {
+    const tag = document.createElement('span');
+    tag.className = 'keyword-tag';
+    tag.appendChild(document.createTextNode(tech));
+    const rm = document.createElement('button');
+    rm.className = 'keyword-tag-remove';
+    rm.textContent = '×';
+    rm.title = 'Remove';
+    rm.addEventListener('click', (e) => { e.stopPropagation(); removeTechStack(tech); });
+    tag.appendChild(rm);
+    techStackTagsBox.insertBefore(tag, techStackInput);
+  });
+}
+
+function addTechStack(tech) {
+  const trimmed = tech.trim();
+  if (!trimmed || selectedTechStack.includes(trimmed)) return;
+  selectedTechStack.push(trimmed);
+  renderTechStackTags();
+  saveTechStack();
+}
+
+function removeTechStack(tech) {
+  selectedTechStack = selectedTechStack.filter(t => t !== tech);
+  renderTechStackTags();
+  saveTechStack();
+}
+
+async function saveTechStack() {
+  await chrome.storage.local.set({ selectedTechStack });
+}
+
+techStackInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const val = techStackInput.value.trim();
+    if (val) { addTechStack(val); techStackInput.value = ''; }
+  }
+  if (e.key === 'Backspace' && techStackInput.value === '' && selectedTechStack.length > 0) {
+    removeTechStack(selectedTechStack[selectedTechStack.length - 1]);
+  }
+});
+
+techStackTagsBox.addEventListener('click', () => techStackInput.focus());
+
 // ── Filters ───────────────────────────────────────────────────────────────────
 
 let scrapeFilters = {
@@ -255,7 +310,7 @@ async function init() {
     'apiUrl', 'authToken', 'autoScrape', 'lastQuery', 'lastPlatform',
     'lastScrapeTime', 'lastScrapeCount', 'lastScrapedTotal', 'scrapeStatus',
     'scheduleInterval', 'scheduleDays', 'scheduleStartHour', 'scheduleEndHour',
-    'selectedKeywords', 'scrapeFilters',
+    'selectedKeywords', 'selectedTechStack', 'scrapeFilters',
   ]);
 
   apiUrl    = data.apiUrl    || 'http://localhost:3001';
@@ -290,6 +345,10 @@ async function init() {
     await saveKeywords();
   }
   renderKeywordTags();
+
+  // Restore tech stack
+  selectedTechStack = data.selectedTechStack || [];
+  renderTechStackTags();
 
   // Restore filters
   if (data.scrapeFilters) Object.assign(scrapeFilters, data.scrapeFilters);
@@ -484,7 +543,7 @@ btnScrape.addEventListener('click', async () => {
   btnScrape.disabled    = true;
   btnScrape.textContent = 'Scraping...';
 
-  chrome.runtime.sendMessage({ type: 'SCRAPE', query, platform, apiUrl, authToken, filters: scrapeFilters });
+  chrome.runtime.sendMessage({ type: 'SCRAPE', query, platform, apiUrl, authToken, filters: scrapeFilters, techStack: selectedTechStack });
 });
 
 btnTest.addEventListener('click', async () => {

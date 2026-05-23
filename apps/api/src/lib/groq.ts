@@ -21,9 +21,20 @@ function trimToWordLimit(text: string, wordLimit?: number): string {
   if (!wordLimit || wordLimit <= 0) return text.trim();
 
   const words = text.trim().split(/\s+/).filter(Boolean);
-  if (words.length <= wordLimit) return text.trim();
+  // Allow 10% overage before trimming
+  if (words.length <= Math.floor(wordLimit * 1.1)) return text.trim();
 
-  return `${words.slice(0, wordLimit).join(' ').trim()}...`;
+  const truncated = words.slice(0, wordLimit).join(' ');
+  // Trim to last sentence boundary rather than cutting mid-word
+  const lastEnd = Math.max(
+    truncated.lastIndexOf('. '),
+    truncated.lastIndexOf('! '),
+    truncated.lastIndexOf('? '),
+  );
+  if (lastEnd > truncated.length * 0.6) {
+    return truncated.substring(0, lastEnd + 1).trim();
+  }
+  return truncated.trim();
 }
 
 // ── Project Analysis ──────────────────────────────────────────────────────────
@@ -149,7 +160,8 @@ export async function generateProposal(
 Write compelling, personalized proposals that win jobs.
 The output must be clean, readable, well-structured, and client-focused.
 Always use strong paragraph structure.
-Default structure unless instruction overrides it: intro -> solution -> value -> CTA -> ending.`;
+Default structure unless instruction overrides it: intro -> solution -> value -> CTA -> ending.
+CRITICAL FORMATTING RULES: No markdown. No asterisks. No bold or italic. No bullet points. No numbered lists. No section headers. No pound signs. Write in clean flowing paragraphs only. Plain text only.`;
 
   const modeGuidance = generationMode === 'instruction'
     ? 'STRICTLY follow the provided instruction for tone, structure, word limit, and ending.'
@@ -203,12 +215,20 @@ Return only the final proposal text.`;
       { role: 'user', content: userPrompt },
     ],
     temperature: 0.7,
-    max_tokens: 1024,
+    max_tokens: 2048,
   });
 
   let proposal = completion.choices[0]?.message?.content || '';
 
-  proposal = proposal.replace(/\n{3,}/g, '\n\n').trim();
+  // Strip markdown artifacts: bold/italic, headers, bullet/numbered list markers
+  proposal = proposal
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/^#{1,6}\s+/gm, '')
+    .replace(/^[\*\-]\s+/gm, '')
+    .replace(/^\d+\.\s+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 
   if (instruction?.appendEnding && instruction.endingText?.trim()) {
     const endingText = instruction.endingText.trim();

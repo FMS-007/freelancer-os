@@ -3,6 +3,8 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useNavigate, useSearchParams } from 'react-router-dom';
+import { useVoiceAssistantStore } from '../store/voiceAssistantStore';
+import { useRegisterVoiceActions } from '../lib/voiceCommands/actionRegistry';
 import {
   Search, ExternalLink, Globe, DollarSign, Users,
   AlertCircle, CheckCircle2, Brain, RefreshCw, Clock,
@@ -80,10 +82,16 @@ function applySort(projects: ScrapedProject[], sort: SortKey): ScrapedProject[] 
   });
 }
 
+/**
+ * STRICT FILTERING: A project passes only if it matches ALL selected criteria
+ * Uses AND logic for all filters (platform, proposals, rating, budget, keywords, etc.)
+ */
 function applyFilters(projects: ScrapedProject[], filters: Filters): ScrapedProject[] {
   return projects.filter((p) => {
+    // 1. PLATFORM (AND logic: must match selected platform)
     if (filters.platform !== 'all' && p.platform !== filters.platform) return false;
 
+    // 2. PROPOSALS (AND logic: all must pass)
     if (filters.maxProposals !== 'any') {
       const max = parseInt(filters.maxProposals, 10);
       if ((p.proposalsCount ?? 999) > max) return false;
@@ -94,11 +102,13 @@ function applyFilters(projects: ScrapedProject[], filters: Filters): ScrapedProj
       if (!isNaN(min) && (p.proposalsCount ?? 0) < min) return false;
     }
 
+    // 3. CLIENT RATING (AND logic: must meet minimum)
     if (filters.minClientRating) {
       const min = parseFloat(filters.minClientRating);
-      if ((p.clientRating ?? 0) < min) return false;
+      if (p.clientRating == null || p.clientRating < min) return false;
     }
 
+    // 4. BUDGET (AND logic: must be within range)
     if (filters.minBudget) {
       const min = parseInt(filters.minBudget, 10);
       if (!isNaN(min) && parseBudgetMin(p.budget) < min) return false;
@@ -109,18 +119,27 @@ function applyFilters(projects: ScrapedProject[], filters: Filters): ScrapedProj
       if (!isNaN(max) && parseBudgetMax(p.budget) > max) return false;
     }
 
+    // 5. INCLUDE KEYWORDS (AND logic: ALL must appear in title/description)
     if (filters.includeKeywords.trim()) {
       const kws = filters.includeKeywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
-      const text = (p.title + ' ' + p.description).toLowerCase();
+      const text = `${p.title || ''} ${p.description || ''}`.toLowerCase();
       if (!kws.every(k => text.includes(k))) return false;
     }
 
+    // 6. EXCLUDE KEYWORDS (AND logic: NONE must appear in title/description)
     if (filters.excludeKeywords.trim()) {
       const kws = filters.excludeKeywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
-      const text = (p.title + ' ' + p.description).toLowerCase();
+      const text = `${p.title || ''} ${p.description || ''}`.toLowerCase();
       if (kws.some(k => text.includes(k))) return false;
     }
 
+    // 7. VERIFICATION FLAGS (AND logic: all selected must be true)
+    if (filters.identityVerified && p.identityVerified === false) return false;
+    if (filters.paymentVerified && p.paymentVerified === false) return false;
+    if (filters.depositMade && p.depositMade === false) return false;
+    if (filters.profileCompleted && p.profileCompleted === false) return false;
+
+    // All filters passed
     return true;
   });
 }
@@ -219,6 +238,61 @@ export default function Scraper() {
   const queryValue      = watch('query') ?? '';
   const normalizedQuery = queryValue.trim().toLowerCase();
 
+  // ── Voice: pending command from cross-page navigation ─────────────────────
+  const voicePending      = useVoiceAssistantStore((s) => s.sessionContext.pendingCommand);
+  const clearVoicePending = useVoiceAssistantStore((s) => s.setPendingCommand);
+  const updateVoiceCtx    = useVoiceAssistantStore((s) => s.updateSessionContext);
+
+  useEffect(() => {
+    if (voicePending?.type === 'search' && voicePending.payload?.query) {
+      const q = voicePending.payload.query;
+      clearVoicePending(null);
+      setValue('query', q, { shouldDirty: true, shouldValidate: true });
+      setTimeout(() => handleSubmit(onSubmit)(), 0);
+    }
+  }, [voicePending]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Same-page voice command via CustomEvent (already on /scraper)
+  useEffect(() => {
+    function onAriaCommand(e: Event) {
+      const detail = (e as CustomEvent).detail as { type: string; payload: Record<string, string> };
+      if (detail?.type === 'search' && detail.payload?.query) {
+        setValue('query', detail.payload.query, { shouldDirty: true, shouldValidate: true });
+        setTimeout(() => handleSubmit(onSubmit)(), 0);
+      }
+    }
+    window.addEventListener('aria:command', onAriaCommand);
+    return () => window.removeEventListener('aria:command', onAriaCommand);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Register voice actions for this page
+  useRegisterVoiceActions(() => [
+    {
+      id: 'scraper.search',
+      route: '/scraper',
+      label: 'Search projects',
+      description: 'Search for freelance projects by keyword',
+      keywords: ['search', 'find', 'look for', 'query'],
+      params: [{ name: 'query', type: 'string', description: 'Search keyword', required: true }],
+      execute: (params) => {
+        const q = String(params?.query ?? '');
+        setValue('query', q, { shouldDirty: true, shouldValidate: true });
+        setTimeout(() => handleSubmit(onSubmit)(), 0);
+      },
+    },
+    {
+      id: 'scraper.clear',
+      route: '/scraper',
+      label: 'Clear search',
+      description: 'Clear current search results',
+      keywords: ['clear', 'reset', 'new search'],
+      execute: () => {
+        setValue('query', '');
+        setValue('platform', 'both');
+      },
+    },
+  ], []);
+
   const suggestions = normalizedQuery.length === 0
     ? []
     : SEARCH_KEYWORDS
@@ -314,6 +388,16 @@ export default function Scraper() {
       setAllResults(projects);
       setPlatformOutcomes(data.platformOutcomes ?? {});
       setResultSource(source);
+      // Sync results to ARIA session context so "open the second one" works
+      updateVoiceCtx({
+        lastProjectList: (projects as ScrapedProject[]).slice(0, 20).map((p, i) => ({
+          id: p.id,
+          title: p.title ?? '',
+          url: p.url ?? '',
+          index: i,
+        })),
+        lastSearchQuery: lastSearch?.query ?? '',
+      });
       setPage(1);
     },
     onError: () => {

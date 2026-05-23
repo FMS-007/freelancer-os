@@ -112,7 +112,7 @@ export default function Sidebar() {
   }
 
   return (
-    <aside className="w-[232px] h-full shrink-0 border-r border-white/5 bg-dark text-slate-300 shadow-[8px_0_30px_rgba(0,0,0,0.12)] overflow-hidden">
+    <aside className="app-sidebar w-[232px] h-full shrink-0 border-r border-white/5 bg-dark text-slate-300 shadow-[8px_0_30px_rgba(0,0,0,0.12)] overflow-hidden">
       <div className="flex h-full min-h-0 flex-col">
         <div className="shrink-0 px-4 pt-4">
           <div className="flex items-center gap-3">

@@ -9,8 +9,17 @@ const PORT = process.env.PORT || 3001;
 
 async function main() {
   try {
-    // Connect to Redis (lazy connect)
-    await redis.connect();
+    // Connect to Redis (non-blocking for dev)
+    try {
+      await redis.connect();
+      console.log('[Redis] Connected');
+    } catch (redisErr) {
+      if (process.env.NODE_ENV === 'development') {
+        console.warn('[Redis] Not available, continuing without cache...');
+      } else {
+        throw redisErr;
+      }
+    }
 
     // Test DB connection
     await prisma.$connect();

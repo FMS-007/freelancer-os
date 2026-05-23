@@ -18,6 +18,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
+import { useAuthStore } from '../store/authStore';
+import { useVoiceAssistantStore } from '../store/voiceAssistantStore';
+import { useRegisterVoiceActions } from '../lib/voiceCommands/actionRegistry';
 import {
   Bot, Play, Square, FlaskConical, CheckCircle2, AlertCircle, Clock,
   SlidersHorizontal, ExternalLink, DollarSign, Globe, Users, Brain,
@@ -26,7 +29,6 @@ import {
 } from 'lucide-react';
 import { scraperApi } from '../lib/api';
 import type { ScrapedProject } from '@freelancer-os/shared';
-import { TECH_SKILLS } from '@freelancer-os/shared';
 import clsx from 'clsx';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -63,6 +65,7 @@ interface RunLog {
 interface ExtState {
   autoScrape?:       boolean;
   selectedKeywords?: string[];
+  selectedTechStack?: string[];
   lastPlatform?:     string;
   scrapeFilters?:    {
     paymentVerified?: boolean;
@@ -168,6 +171,9 @@ function extStateToConfigPatch(state: ExtState): Partial<AutomationConfig> {
   if (Array.isArray(state.scheduleDays)) {
     patch.activeDays = state.scheduleDays;
   }
+  if (Array.isArray(state.selectedTechStack)) {
+    patch.techStack = state.selectedTechStack;
+  }
   if (state.scrapeFilters) {
     const f = state.scrapeFilters;
     if (f.paymentVerified !== undefined) patch.paymentVerified  = f.paymentVerified;
@@ -189,6 +195,7 @@ function configToExtState(config: AutomationConfig): Record<string, unknown> {
     scheduleStartHour: timeToHour(config.startTime),
     scheduleEndHour:   timeToHour(config.endTime),
     scheduleDays:      config.activeDays,
+    selectedTechStack: config.techStack,
     scrapeFilters: {
       paymentVerified: config.paymentVerified,
       profileVerified: config.identityVerified,
@@ -199,52 +206,89 @@ function configToExtState(config: AutomationConfig): Record<string, unknown> {
   };
 }
 
+/**
+ * STRICT FILTERING: A project passes only if it matches ALL selected criteria
+ * Uses AND logic for all filters (keywords, verification, ratings, budget, etc.)
+ * 
+ * Keyword matching:
+ * - Main query keywords: OR logic (at least one must match)
+ * - Include keywords: AND logic (all must match)
+ * - Exclude keywords: AND logic (none must match)
+ * - Tech stack: AND logic (all selected techs must be present)
+ */
 function matchesConfig(project: ScrapedProject, cfg: AutomationConfig): boolean {
-  if (cfg.maxProposals !== 'any') {
-    const max = parseInt(cfg.maxProposals, 10);
-    if ((project.proposalsCount ?? 999) > max) return false;
+  const text = `${project.title || ''} ${project.description || ''}`.toLowerCase();
+
+  // 1. MAIN QUERY KEYWORDS (OR logic: at least one must match)
+  // If keywords are set, project must contain at least one
+  if (cfg.query.trim()) {
+    const keywords = cfg.query.split(',').map(k => k.trim().toLowerCase()).filter(Boolean);
+    if (keywords.length > 0) {
+      const hasKeyword = keywords.some(kw => text.includes(kw));
+      if (!hasKeyword) return false;
+    }
   }
-  if (cfg.minClientRating) {
-    const min = parseFloat(cfg.minClientRating);
-    if (project.clientRating != null && project.clientRating < min) return false;
-  }
-  if (cfg.minClientReviews) {
-    const min = parseInt(cfg.minClientReviews, 10);
-    if (!isNaN(min) && project.clientReviewCount != null && project.clientReviewCount < min) return false;
-  }
-  const text = (project.title + ' ' + project.description).toLowerCase();
+
+  // 2. INCLUDE KEYWORDS (AND logic: ALL must appear in title/description)
   if (cfg.includeKeywords.trim()) {
     const kws = cfg.includeKeywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
     if (!kws.every(k => text.includes(k))) return false;
   }
+
+  // 3. EXCLUDE KEYWORDS (AND logic: NONE must appear in title/description)
   if (cfg.excludeKeywords.trim()) {
     const kws = cfg.excludeKeywords.toLowerCase().split(',').map(k => k.trim()).filter(Boolean);
     if (kws.some(k => text.includes(k))) return false;
   }
+
+  // 4. TECH STACK (AND logic: ALL selected techs must be present)
   if (cfg.techStack.length > 0) {
     const skillSet = (project.skills ?? []).map(s => s.toLowerCase());
-    // Normalize: strip dots/spaces so "node.js" matches "nodejs", "Node JS", etc.
     const norm = (s: string) => s.toLowerCase().replace(/[.\s]/g, '');
-    const hasStack = cfg.techStack.some(t => {
-      const tl   = t.toLowerCase();
-      const tlN  = norm(t);
+    
+    // ALL tech stack items must be present
+    const hasAllTechs = cfg.techStack.every(t => {
+      const tl = t.toLowerCase();
+      const tlN = norm(t);
       return skillSet.some(s => s.includes(tl) || norm(s).includes(tlN))
         || text.includes(tl) || norm(text).includes(tlN);
     });
-    if (!hasStack) return false;
+    if (!hasAllTechs) return false;
   }
+
+  // 5. VERIFICATION FLAGS (AND logic: all selected must be true)
+  if (cfg.identityVerified && project.identityVerified === false) return false;
+  if (cfg.paymentVerified && project.paymentVerified === false) return false;
+  if (cfg.depositMade && project.depositMade === false) return false;
+  if (cfg.profileCompleted && project.profileCompleted === false) return false;
+
+  // 6. NUMERIC FILTERS (AND logic: all must pass)
+  if (cfg.minClientRating) {
+    const min = parseFloat(cfg.minClientRating);
+    if (project.clientRating == null || project.clientRating < min) return false;
+  }
+
+  if (cfg.minClientReviews) {
+    const min = parseInt(cfg.minClientReviews, 10);
+    if (!isNaN(min) && (project.clientReviewCount == null || project.clientReviewCount < min)) return false;
+  }
+
   if (cfg.minBudget) {
     const min = parseFloat(cfg.minBudget);
     if (!isNaN(min) && parseBudgetMin(project.budget) < min) return false;
   }
+
   if (cfg.maxBudget) {
     const max = parseFloat(cfg.maxBudget);
     if (!isNaN(max) && parseBudgetMin(project.budget) > max) return false;
   }
-  if (cfg.identityVerified && project.identityVerified === false) return false;
-  if (cfg.paymentVerified  && project.paymentVerified  === false) return false;
-  if (cfg.depositMade      && project.depositMade      === false) return false;
-  if (cfg.profileCompleted && project.profileCompleted === false) return false;
+
+  if (cfg.maxProposals !== 'any') {
+    const max = parseInt(cfg.maxProposals, 10);
+    if ((project.proposalsCount ?? 999) > max) return false;
+  }
+
+  // All filters passed - project matches
   return true;
 }
 
@@ -257,20 +301,31 @@ function fmt(d: Date): string {
 export default function Automation() {
   const navigate     = useNavigate();
   const queryClient  = useQueryClient();
+  const authUserId   = useAuthStore(s => s.user?.id) ?? 'guest';
 
-  const [config, setConfig] = useState<AutomationConfig>(() =>
-    loadStorage<AutomationConfig>('fos_autoConfig', DEFAULT_CONFIG),
-  );
-  const [enabled,         setEnabled]         = useState(() =>
-    loadStorage<boolean>('fos_autoEnabled', false),
-  );
+  // User-scoped storage keys — prevents one user's data leaking to another
+  const KEY_CONFIG  = `fos_${authUserId}_autoConfig`;
+  const KEY_ENABLED = `fos_${authUserId}_autoEnabled`;
+  const KEY_MATCHED = `fos_${authUserId}_matchedProjects`;
+  const KEY_SAVED   = `fos_${authUserId}_savedProjects`;
+
+  const [config, setConfig] = useState<AutomationConfig>(() => {
+    const uid = useAuthStore.getState().user?.id ?? 'guest';
+    return loadStorage<AutomationConfig>(`fos_${uid}_autoConfig`, DEFAULT_CONFIG);
+  });
+  const [enabled,         setEnabled]         = useState(() => {
+    const uid = useAuthStore.getState().user?.id ?? 'guest';
+    return loadStorage<boolean>(`fos_${uid}_autoEnabled`, false);
+  });
   const [running,         setRunning]          = useState(false);
-  const [matchedProjects, setMatchedProjects]  = useState<ScrapedProject[]>(() =>
-    loadStorage<ScrapedProject[]>('fos_matchedProjects', []),
-  );
-  const [savedProjects,   setSavedProjects]    = useState<ScrapedProject[]>(() =>
-    loadStorage<ScrapedProject[]>('fos_savedProjects', []),
-  );
+  const [matchedProjects, setMatchedProjects]  = useState<ScrapedProject[]>(() => {
+    const uid = useAuthStore.getState().user?.id ?? 'guest';
+    return loadStorage<ScrapedProject[]>(`fos_${uid}_matchedProjects`, []);
+  });
+  const [savedProjects,   setSavedProjects]    = useState<ScrapedProject[]>(() => {
+    const uid = useAuthStore.getState().user?.id ?? 'guest';
+    return loadStorage<ScrapedProject[]>(`fos_${uid}_savedProjects`, []);
+  });
   const [logs,            setLogs]             = useState<RunLog[]>([]);
   const [lastRun,         setLastRun]          = useState<string | null>(null);
   const [nextRunIn,       setNextRunIn]        = useState<string>('—');
@@ -343,31 +398,81 @@ export default function Automation() {
     function onExtStateChanged(e: Event) {
       applyExtState((e as CustomEvent<ExtState>).detail || {});
     }
+    function onExtContextInvalidated() {
+      setExtensionInstalled(false);
+      setExtensionStatus('Extension reloaded. Refresh this page to reconnect automation bridge.');
+      setLogs(prev => [{ ts: fmt(new Date()), message: 'Extension context invalidated. Refresh page to reconnect.', type: 'warn' as const }, ...prev].slice(0, 50));
+    }
     window.addEventListener('FOS_EXT_STATE',         onExtState);
     window.addEventListener('FOS_EXT_STATE_CHANGED', onExtStateChanged);
+    window.addEventListener('FOS_EXT_CONTEXT_INVALIDATED', onExtContextInvalidated);
     return () => {
       window.removeEventListener('FOS_EXT_STATE',         onExtState);
       window.removeEventListener('FOS_EXT_STATE_CHANGED', onExtStateChanged);
+      window.removeEventListener('FOS_EXT_CONTEXT_INVALIDATED', onExtContextInvalidated);
     };
   }, [applyExtState]);
 
   // ── Persist config to localStorage ────────────────────────────────────────
 
   useEffect(() => {
-    localStorage.setItem('fos_autoConfig', JSON.stringify(config));
-  }, [config]);
+    localStorage.setItem(KEY_CONFIG, JSON.stringify(config));
+  }, [config, KEY_CONFIG]);
 
   useEffect(() => {
-    localStorage.setItem('fos_autoEnabled', JSON.stringify(enabled));
-  }, [enabled]);
+    localStorage.setItem(KEY_ENABLED, JSON.stringify(enabled));
+  }, [enabled, KEY_ENABLED]);
 
   useEffect(() => {
-    localStorage.setItem('fos_matchedProjects', JSON.stringify(matchedProjects.slice(0, 200)));
-  }, [matchedProjects]);
+    localStorage.setItem(KEY_MATCHED, JSON.stringify(matchedProjects.slice(0, 200)));
+  }, [matchedProjects, KEY_MATCHED]);
 
   useEffect(() => {
-    localStorage.setItem('fos_savedProjects', JSON.stringify(savedProjects));
-  }, [savedProjects]);
+    localStorage.setItem(KEY_SAVED, JSON.stringify(savedProjects));
+  }, [savedProjects, KEY_SAVED]);
+
+  // ── Voice: pending command from cross-page navigation ─────────────────────
+  const voicePending      = useVoiceAssistantStore((s) => s.sessionContext.pendingCommand);
+  const clearVoicePending = useVoiceAssistantStore((s) => s.setPendingCommand);
+
+  useEffect(() => {
+    if (voicePending?.type === 'automation') {
+      setEnabled(voicePending.payload?.action === 'start');
+      clearVoicePending(null);
+    }
+  }, [voicePending]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Same-page voice command via CustomEvent (already on /automation)
+  useEffect(() => {
+    function onAriaCommand(e: Event) {
+      const detail = (e as CustomEvent).detail as { type: string; payload: Record<string, string> };
+      if (detail?.type === 'automation') {
+        setEnabled(detail.payload?.action === 'start');
+      }
+    }
+    window.addEventListener('aria:command', onAriaCommand);
+    return () => window.removeEventListener('aria:command', onAriaCommand);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Register voice actions for this page
+  useRegisterVoiceActions(() => [
+    {
+      id: 'automation.start',
+      route: '/automation',
+      label: 'Start automation',
+      description: 'Enable automated project scraping',
+      keywords: ['start', 'enable', 'turn on', 'activate', 'begin'],
+      execute: () => setEnabled(true),
+    },
+    {
+      id: 'automation.stop',
+      route: '/automation',
+      label: 'Stop automation',
+      description: 'Disable automated project scraping',
+      keywords: ['stop', 'disable', 'turn off', 'deactivate', 'pause'],
+      execute: () => setEnabled(false),
+    },
+  ], []);
 
   // ── Re-filter matched projects when platform changes ──────────────────────
   // Prevents projects from the previously selected platform from lingering.
@@ -423,6 +528,12 @@ export default function Automation() {
       } else if (msg.type === 'SCRAPE_DONE') {
         setExtensionStatus('');
         setRunning(false);
+        const doneMsg = msg as unknown as { type: string; error?: string; count?: number; scrapedTotal?: number };
+        if (doneMsg.error) {
+          addLog(`Extension error: ${doneMsg.error}`, 'error');
+        } else {
+          addLog(`Done — ${doneMsg.scrapedTotal ?? 0} scraped → ${doneMsg.count ?? 0} matched`, 'success');
+        }
         // Give backend 2 s to store the results, then fetch immediately
         setTimeout(() => {
           queryClient.invalidateQueries({ queryKey: ['automation-auto-results'] });
@@ -490,25 +601,40 @@ export default function Automation() {
       const platformFiltered = config.platform === 'both'
         ? incomingProjects
         : incomingProjects.filter(p => p.platform === config.platform);
-      // Apply automation filters only when a query/config is set; otherwise show everything
-      const filtered = config.query.trim()
-        ? platformFiltered.filter(p => matchesConfig(p, config))
-        : platformFiltered;
+      // Always apply client-side filters. The extension pre-filters basic criteria
+      // (keywords, techStack, verifications, rating, reviews) but the Automation page
+      // may have additional filters (includeKeywords, excludeKeywords, maxProposals,
+      // budget) that are not synced to the extension. matchesConfig is a no-op when
+      // all filter fields are at their defaults, so this never hides valid projects.
+      const filtered = platformFiltered.filter(p => matchesConfig(p, config));
 
       console.log(
         `[Automation] auto-results poll: received=${incomingProjects.length}` +
         ` platform_filtered=${platformFiltered.length} matched=${filtered.length}`,
       );
 
-      setMatchedProjects(prev => {
-        const existingIds = new Set(prev.map(p => p.id));
-        const newOnes = filtered.filter(p => !existingIds.has(p.id));
-        if (newOnes.length > 0) {
-          console.log(`[Automation] Adding ${newOnes.length} new project(s) to UI`);
-          setTimeout(() => addLog(`${newOnes.length} new project(s) added (${incomingProjects.length} received → ${filtered.length} matched)`, 'success'), 0);
-        }
-        return newOnes.length > 0 ? [...newOnes, ...prev] : prev;
-      });
+      if (extensionInstalled) {
+        setMatchedProjects((prev) => {
+          const existingIds = new Set(prev.map(p => p.id));
+          const newOnes = filtered.filter(p => !existingIds.has(p.id));
+          if (newOnes.length > 0) {
+            console.log(`[Automation] Adding ${newOnes.length} new project(s) from extension`);
+            setTimeout(() => addLog(`${newOnes.length} project(s) synced from extension`, 'success'), 0);
+            setMatchedPage(1);
+          }
+          return newOnes.length > 0 ? [...newOnes, ...prev] : prev;
+        });
+      } else {
+        setMatchedProjects(prev => {
+          const existingIds = new Set(prev.map(p => p.id));
+          const newOnes = filtered.filter(p => !existingIds.has(p.id));
+          if (newOnes.length > 0) {
+            console.log(`[Automation] Adding ${newOnes.length} new project(s) to UI`);
+            setTimeout(() => addLog(`${newOnes.length} new project(s) added (${incomingProjects.length} received → ${filtered.length} matched)`, 'success'), 0);
+          }
+          return newOnes.length > 0 ? [...newOnes, ...prev] : prev;
+        });
+      }
 
       // Auto-save filtered matches
       setSavedProjects(prev => {
@@ -524,7 +650,7 @@ export default function Automation() {
         return toSave.length > 0 ? [...toSave, ...prev] : prev;
       });
     }
-  }, [autoResultsData, config, addLog]);
+  }, [autoResultsData, config, addLog, extensionInstalled]);
 
   // ── Extension trigger helper ───────────────────────────────────────────────
 
@@ -700,10 +826,11 @@ export default function Automation() {
     const next = !enabled;
     setEnabled(next);
 
-    // Sync toggle back to extension immediately
+    // Sync toggle back to extension immediately — include full config so keywords
+    // are in extension storage before the immediate scrape cycle fires.
     if (extensionInstalled) {
       window.dispatchEvent(new CustomEvent('FOS_SET_EXT_STATE', {
-        detail: { autoScrape: next },
+        detail: { ...configToExtState(config), autoScrape: next },
       }));
       // Request fresh state after toggle to ensure sync
       setTimeout(() => {
@@ -765,10 +892,6 @@ export default function Automation() {
   const totalMatchPages = Math.max(1, Math.ceil(matchedProjects.length / AUTO_PAGE_SIZE));
   const safeMPage       = Math.min(matchedPage, totalMatchPages);
   const visibleMatched  = matchedProjects.slice((safeMPage - 1) * AUTO_PAGE_SIZE, safeMPage * AUTO_PAGE_SIZE);
-  const stackSuggestions = stackSearch.trim().length === 0 ? [] :
-    TECH_SKILLS
-      .filter(s => s.toLowerCase().includes(stackSearch.toLowerCase()) && !config.techStack.includes(s))
-      .slice(0, 8);
 
   const statusLabel = enabled
     ? running
@@ -812,39 +935,34 @@ export default function Automation() {
     <div className="page-shell">
 
       {/* ── Header ──────────────────────────────────────────────────────── */}
-      <div className="flex items-start justify-between mb-6 gap-4 flex-wrap">
+      <div className="flex items-start justify-between mb-4 gap-4 flex-wrap">
         <div>
           <h1 className="text-2xl font-bold text-dark flex items-center gap-2">
             <Bot size={22} className="text-primary" /> Automation
           </h1>
-          <p className="text-slate-500 mt-0.5">
+          <p className="text-slate-500 mt-0.5 text-sm">
             {extensionInstalled
-              ? 'Extension-driven automation — settings sync with the popup in real time'
-              : 'Auto-fetch and save projects that match your criteria on a schedule'}
+              ? 'Extension-driven — settings sync with popup in real time'
+              : 'Auto-fetch projects matching your criteria on a schedule'}
           </p>
         </div>
 
-        <div className="flex items-center gap-3 flex-wrap">
-          <span className={clsx('flex items-center gap-1.5 text-sm font-medium', statusColor)}>
-            <span className={clsx('w-2 h-2 rounded-full inline-block', statusDot)} />
-            {statusLabel}
-          </span>
-
+        <div className="flex items-center gap-2 flex-wrap">
           <button
             onClick={() => setShowSavedPanel(v => !v)}
             className={clsx(
-              'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border transition-colors',
+              'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors',
               showSavedPanel
                 ? 'bg-primary/10 border-primary/30 text-primary'
-                : 'bg-slate-50 border-slate-200 text-slate-500 hover:border-primary/30 hover:text-primary',
+                : 'bg-white border-slate-200 text-slate-500 hover:border-primary/30 hover:text-primary',
             )}
           >
             <Bookmark size={11} />
-            Saved {savedProjects.length > 0 && `(${savedProjects.length})`}
+            Saved {savedProjects.length > 0 && <span className="ml-0.5 bg-primary text-white rounded-full px-1.5 py-0.5 text-[9px] font-bold">{savedProjects.length}</span>}
           </button>
 
           <span className={clsx(
-            'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border',
+            'flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border',
             scraperOnline === true
               ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
               : scraperOnline === false
@@ -852,14 +970,54 @@ export default function Automation() {
                 : 'bg-slate-50 border-slate-200 text-slate-400',
           )}>
             <Zap size={10} />
-            {scraperOnline === true ? 'Scraper Online' : scraperOnline === false ? 'Scraper Offline' : 'Checking...'}
+            {scraperOnline === true ? 'Scraper Online' : scraperOnline === false ? 'Offline' : 'Checking...'}
           </span>
 
           {extensionInstalled && (
-            <span className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border bg-primary/5 border-primary/20 text-primary">
+            <span className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border bg-primary/5 border-primary/20 text-primary">
               <Puzzle size={10} /> Extension Active
             </span>
           )}
+        </div>
+      </div>
+
+      {/* ── Stats bar ──────────────────────────────────────────────────────── */}
+      <div className="grid grid-cols-3 sm:grid-cols-4 gap-3 mb-6">
+        <div className="card px-4 py-3 flex items-center gap-3">
+          <div className={clsx('w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0', enabled ? 'bg-emerald-50' : 'bg-slate-50')}>
+            <span className={clsx('w-2.5 h-2.5 rounded-full', statusDot)} />
+          </div>
+          <div>
+            <p className="text-[10px] text-slate-400 uppercase tracking-wide">Status</p>
+            <p className={clsx('text-xs font-semibold leading-tight', statusColor)}>{enabled ? (running ? 'Running' : 'Active') : 'Stopped'}</p>
+          </div>
+        </div>
+        <div className="card px-4 py-3 flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-primary/5 flex items-center justify-center flex-shrink-0">
+            <CheckCircle2 size={14} className="text-primary" />
+          </div>
+          <div>
+            <p className="text-[10px] text-slate-400 uppercase tracking-wide">Matched</p>
+            <p className="text-xs font-semibold text-dark">{matchedProjects.length}</p>
+          </div>
+        </div>
+        <div className="card px-4 py-3 flex items-center gap-3">
+          <div className="w-8 h-8 rounded-lg bg-amber-50 flex items-center justify-center flex-shrink-0">
+            <Bookmark size={14} className="text-amber-500" />
+          </div>
+          <div>
+            <p className="text-[10px] text-slate-400 uppercase tracking-wide">Saved</p>
+            <p className="text-xs font-semibold text-dark">{savedProjects.length}</p>
+          </div>
+        </div>
+        <div className="card px-4 py-3 flex items-center gap-3 hidden sm:flex">
+          <div className="w-8 h-8 rounded-lg bg-slate-50 flex items-center justify-center flex-shrink-0">
+            <Clock size={14} className="text-slate-400" />
+          </div>
+          <div>
+            <p className="text-[10px] text-slate-400 uppercase tracking-wide">Next Run</p>
+            <p className="text-xs font-semibold text-dark truncate">{nextRunIn}</p>
+          </div>
         </div>
       </div>
 
@@ -1019,23 +1177,19 @@ export default function Automation() {
               <input
                 value={stackSearch}
                 onChange={e => setStackSearch(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === 'Enter' && stackSearch.trim()) {
+                    e.preventDefault();
+                    toggleStack(stackSearch.trim());
+                    setStackSearch('');
+                  }
+                }}
                 className="input text-xs"
-                placeholder="Search tech skills to add..."
+                placeholder="Type a technology and press Enter..."
               />
-              {stackSuggestions.length > 0 && (
-                <div className="mt-1.5 flex flex-wrap gap-1.5">
-                  {stackSuggestions.map(s => (
-                    <button
-                      key={s}
-                      type="button"
-                      onClick={() => { toggleStack(s); setStackSearch(''); }}
-                      className="text-[11px] px-2 py-0.5 rounded border bg-slate-50 border-slate-200 text-slate-600 hover:border-primary/30 hover:bg-primary/5 hover:text-primary transition-colors"
-                    >
-                      + {s}
-                    </button>
-                  ))}
-                </div>
-              )}
+              <p className="text-[10px] text-slate-400 mt-1">
+                Enter any technology name (e.g., React, Python, Docker, etc.)
+              </p>
             </div>
 
             {config.techStack.length === 0 && (
@@ -1206,30 +1360,30 @@ export default function Automation() {
           </div>
 
           {/* Controls */}
-          <div className="card p-5">
-            <div className="flex items-center gap-3 flex-wrap">
+          <div className="card p-5 space-y-3">
+            <div className="flex items-center gap-2 flex-wrap">
               <button
                 onClick={handleToggleEnable}
                 disabled={scraperOnline === false && !extensionInstalled}
                 className={clsx(
-                  'flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors border',
+                  'flex items-center gap-2 px-5 py-2.5 rounded-lg text-sm font-semibold transition-all border shadow-sm',
                   enabled
-                    ? 'bg-red-50 border-red-200 text-red-600 hover:bg-red-100'
-                    : 'btn-primary',
+                    ? 'bg-red-50 border-red-200 text-red-600 hover:bg-red-100 hover:shadow-none'
+                    : 'bg-primary border-primary text-white hover:bg-primary/90 hover:shadow-none',
                   (scraperOnline === false && !extensionInstalled) && 'opacity-50 cursor-not-allowed',
                 )}
               >
                 {enabled
                   ? <><Square size={14} /> Stop Automation</>
-                  : <><Play size={14} /> Start Automation</>}
+                  : <><Play size={14} fill="currentColor" /> Start Automation</>}
               </button>
 
               <button
                 onClick={handleTest}
                 disabled={running || (scraperOnline === false && !extensionInstalled)}
                 className={clsx(
-                  'flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium border transition-colors',
-                  'bg-white border-slate-200 text-slate-600 hover:border-primary/40 hover:text-primary',
+                  'flex items-center gap-1.5 px-3 py-2.5 rounded-lg text-xs font-medium border transition-all',
+                  'bg-white border-slate-200 text-slate-600 hover:border-primary/40 hover:text-primary hover:bg-primary/5',
                   (running || (scraperOnline === false && !extensionInstalled)) && 'opacity-50 cursor-not-allowed',
                 )}
               >
@@ -1237,40 +1391,44 @@ export default function Automation() {
                   ? <><RefreshCw size={12} className="animate-spin" /> {extensionStatus || 'Running...'}</>
                   : <><FlaskConical size={12} /> Test Now</>}
               </button>
-
-              {scraperOnline === false && !extensionInstalled && (
-                <p className="text-xs text-red-500 flex items-center gap-1">
-                  <AlertCircle size={11} /> Start the scraper or install the extension
-                </p>
-              )}
-              {scraperOnline === false && extensionInstalled && (
-                <p className="text-xs text-primary flex items-center gap-1">
-                  <CheckCircle2 size={11} /> Extension active — scraper not required
-                </p>
-              )}
             </div>
 
+            {scraperOnline === false && !extensionInstalled && (
+              <p className="text-xs text-red-500 flex items-center gap-1.5 bg-red-50 px-3 py-2 rounded-lg border border-red-100">
+                <AlertCircle size={11} /> Start the scraper or install the extension
+              </p>
+            )}
+            {scraperOnline === false && extensionInstalled && (
+              <p className="text-xs text-primary flex items-center gap-1.5 bg-primary/5 px-3 py-2 rounded-lg border border-primary/10">
+                <CheckCircle2 size={11} /> Extension active — scraper not required
+              </p>
+            )}
+
             {lastRun && (
-              <p className="text-xs text-slate-400 mt-2.5">Last run: {lastRun}</p>
+              <p className="text-xs text-slate-400 flex items-center gap-1">
+                <Clock size={10} /> Last run: {lastRun}
+              </p>
             )}
           </div>
 
           {/* Activity log */}
           {logs.length > 0 && (
             <div className="card p-4">
-              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Activity Log</p>
-              <div className="space-y-1 max-h-40 overflow-y-auto">
+              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3 flex items-center gap-1.5">
+                <Zap size={10} className="text-primary" /> Activity Log
+              </p>
+              <div className="space-y-1.5 max-h-44 overflow-y-auto pr-1">
                 {logs.map((l, i) => (
-                  <p key={i} className={clsx(
-                    'text-[11px] flex gap-2',
-                    l.type === 'success' ? 'text-emerald-600'
-                      : l.type === 'warn'  ? 'text-amber-600'
-                      : l.type === 'error' ? 'text-red-500'
+                  <div key={i} className={clsx(
+                    'text-[11px] flex gap-2 items-start px-2 py-1 rounded',
+                    l.type === 'success' ? 'text-emerald-700 bg-emerald-50/60'
+                      : l.type === 'warn'  ? 'text-amber-700 bg-amber-50/60'
+                      : l.type === 'error' ? 'text-red-600 bg-red-50/60'
                       : 'text-slate-500',
                   )}>
-                    <span className="text-slate-300 flex-shrink-0">{l.ts}</span>
-                    {l.message}
-                  </p>
+                    <span className="text-slate-300 flex-shrink-0 font-mono">{l.ts}</span>
+                    <span>{l.message}</span>
+                  </div>
                 ))}
               </div>
             </div>
@@ -1284,30 +1442,32 @@ export default function Automation() {
               <CheckCircle2 size={14} className="text-emerald-500" />
               Matched Projects
               {matchedProjects.length > 0 && (
-                <span className="px-1.5 py-0.5 bg-emerald-50 border border-emerald-200 text-emerald-600 rounded text-[10px] font-medium">
+                <span className="px-2 py-0.5 bg-emerald-100 border border-emerald-200 text-emerald-700 rounded-full text-[10px] font-bold">
                   {matchedProjects.length}
                 </span>
               )}
             </h2>
             {matchedProjects.length > 0 && (
-              <button onClick={clearMatched} className="text-xs text-slate-400 hover:text-danger flex items-center gap-1">
-                <X size={11} /> Clear all
+              <button onClick={clearMatched} className="text-xs text-slate-400 hover:text-red-500 flex items-center gap-1 transition-colors">
+                <X size={11} /> Clear
               </button>
             )}
           </div>
 
           {matchedProjects.length === 0 && (
-            <div className="card p-12 text-center text-slate-400">
-              <Bot size={32} className="mx-auto mb-3 text-slate-200" />
-              <p className="text-sm font-medium">No matches yet</p>
-              <p className="text-xs text-slate-400 mt-1">
+            <div className="card p-12 text-center">
+              <div className="w-14 h-14 rounded-2xl bg-slate-50 flex items-center justify-center mx-auto mb-4">
+                <Bot size={28} className="text-slate-300" />
+              </div>
+              <p className="text-sm font-semibold text-slate-600">No matches yet</p>
+              <p className="text-xs text-slate-400 mt-1.5 max-w-xs mx-auto">
                 {extensionInstalled
                   ? enabled
                     ? 'Waiting for the extension to push results…'
-                    : 'Enable automation or click Test Now.'
+                    : 'Enable automation or click Test Now to begin.'
                   : config.query
                     ? 'Click "Test Now" or "Start Automation" to fetch projects.'
-                    : 'Set a search query, then test or start automation.'}
+                    : 'Set a search query above, then start automation.'}
               </p>
             </div>
           )}
@@ -1316,7 +1476,10 @@ export default function Automation() {
             {visibleMatched.map(project => {
               const isSaved = savedProjects.some(p => p.id === project.id);
               return (
-                <div key={project.id} className="card p-4">
+                <div key={project.id} className={clsx(
+                  'card p-4 border-l-2 transition-shadow hover:shadow-md',
+                  project.platform === 'upwork' ? 'border-l-emerald-400' : 'border-l-blue-400',
+                )}>
                   <div className="flex items-start gap-4">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2 flex-wrap mb-1">

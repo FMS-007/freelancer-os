@@ -23,15 +23,21 @@ export default function Login() {
       login(res.user, res.accessToken, res.refreshToken);
       navigate('/');
     } catch (err: unknown) {
-      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error;
-      setServerError(msg || 'Login failed. Please try again.');
+      const axiosErr = err as { response?: { status?: number; data?: { error?: string; requiresVerification?: boolean; email?: string } } };
+      const body = axiosErr?.response?.data;
+
+      if (axiosErr?.response?.status === 403 && body?.requiresVerification) {
+        navigate(`/verify-email?email=${encodeURIComponent(body.email || data.email)}&purpose=verify`);
+        return;
+      }
+
+      setServerError(body?.error || 'Login failed. Please try again.');
     }
   }
 
   return (
     <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
       <div className="w-full max-w-md">
-        {/* Logo */}
         <div className="flex items-center justify-center gap-3 mb-8">
           <div className="w-10 h-10 bg-primary rounded-xl flex items-center justify-center">
             <Zap size={20} className="text-white" />
@@ -65,7 +71,12 @@ export default function Login() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-slate-300 mb-1">Password</label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-sm font-medium text-slate-300">Password</label>
+                <Link to="/forgot-password" className="text-xs text-primary hover:text-primary-400 transition-colors">
+                  Forgot password?
+                </Link>
+              </div>
               <input
                 {...register('password')}
                 type="password"

@@ -249,7 +249,7 @@ router.post('/extension-results', authenticate, async (req: AuthRequest, res: Re
     // Extension already applies 24-hour freshness via _postedMs before sending.
     // Store all received projects; do not re-filter by date string (date-only strings
     // from Freelancer parse to midnight and falsely fail the freshness check).
-    await setCache(cacheKey, projects, 600);
+    await setCache(cacheKey, projects, 86400); // 24-hour TTL (was 600s — too short)
     console.log(`[extension-results] Stored ${projects.length} project(s) for user ${userId}, query='${normalizedQ}', platform='${plat}'`);
 
     res.json({ success: true, received: projects.length, fresh: projects.length, platform: plat, query: normalizedQ });
@@ -396,16 +396,18 @@ router.post('/auto-results', authenticate, async (req: AuthRequest, res: Respons
     // We do NOT merge with the old cache here — each run replaces with a new deduplicated set
     // to prevent the saved count from accumulating beyond what was actually scraped.
     const projKey  = `auto-projects:${userId}`;
-    const existing = await getCache<unknown[]>(projKey) ?? [];
-    const existingIds = new Set((existing as Array<Record<string, unknown>>).map(p => p.id as string));
-    const newOnes  = allProjects.filter(p => !existingIds.has(p.id as string));
-    // Merge: new unique projects at front, keep existing up to 500 total
-    const merged   = [...newOnes, ...existing].slice(0, 500);
-    await setCache(projKey, merged, 60 * 60 * 24); // 24-hour TTL
+    const seenRunIds = new Set<string>();
+    const currentRunProjects = allProjects.filter((p) => {
+      const pid = String(p.id || '');
+      if (!pid || seenRunIds.has(pid)) return false;
+      seenRunIds.add(pid);
+      return true;
+    }).slice(0, 500);
+    await setCache(projKey, currentRunProjects, 60 * 60 * 24); // 24-hour TTL
 
     // Also persist new projects to DB (ProjectRecord) — deduplicate by URL
     let dbSaved = 0;
-    for (const p of newOnes) {
+    for (const p of currentRunProjects) {
       try {
         const url = p.url ? String(p.url) : null;
         if (url) {
@@ -432,12 +434,12 @@ router.post('/auto-results', authenticate, async (req: AuthRequest, res: Respons
       console.log(`[auto-results] Saved ${dbSaved} new project(s) to DB for user ${userId}`);
     }
 
-    console.log(`[auto-results] Stored ${newOnes.length} new / ${existing.length} existing for user ${userId}`);
+    console.log(`[auto-results] Stored ${currentRunProjects.length} project(s) for current run for user ${userId}`);
     res.json({
       success: true,
       received: receivedCount,
       fresh: receivedCount,
-      stored: newOnes.length,
+      stored: currentRunProjects.length,
       dbSaved,
     });
   } catch (err) {
