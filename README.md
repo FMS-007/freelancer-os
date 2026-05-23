@@ -14,6 +14,7 @@ Purpose: provide a reproducible local development environment and reference for 
 - Browser scraper (Python): [apps/scraper](apps/scraper)
 - Chrome extension: [apps/extension](apps/extension)
 - Shared packages: [packages](packages)
+- Architecture visual: [architecture.html](architecture.html)
 
 -----
 
@@ -76,15 +77,11 @@ python apps/scraper/api.py
 
 -----
 
-## Configuration / Important environment variables
+## Configuration
 
-- `DATABASE_URL` — Postgres connection string used by Prisma.
-- `REDIS_URL` — Redis connection for caching and automation state.
-- `JWT_SECRET`, `JWT_REFRESH_SECRET` — auth tokens.
-- `CORS_ORIGIN` — frontend origin for local dev.
-- `SCRAPER_URL` — endpoint for the Playwright scraper (when run separately).
+This project uses environment variables and secret values for configuration. Do not list or commit secret names or values in public documentation.
 
-Additional provider keys (only for optional integrations): `AWS_*`, `GOOGLE_CLIENT_*`, `FIREBASE_SERVICE_ACCOUNT`, `OPENAI_API_KEY`.
+Refer to the private onboarding docs or the internal `.env.example` file for exact variable names and access instructions (access-controlled).
 
 -----
 
