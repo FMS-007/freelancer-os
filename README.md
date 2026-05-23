@@ -14,7 +14,6 @@ Purpose: provide a reproducible local development environment and reference for 
 - Browser scraper (Python): [apps/scraper](apps/scraper)
 - Chrome extension: [apps/extension](apps/extension)
 - Shared packages: [packages](packages)
-- Architecture visual: [architecture.html](architecture.html)
 
 -----
 
@@ -45,21 +44,14 @@ docker compose up -d
 pnpm install
 ```
 
-3) Copy env and populate values:
-
-```bash
-cp .env.example .env
-# edit .env (DATABASE_URL, REDIS_URL, JWT secrets)
-```
-
-4) Generate Prisma client and run migrations (API container or locally):
+3) Generate Prisma client and run migrations (API container or locally):
 
 ```bash
 pnpm --filter @freelancer-os/api prisma:generate
 pnpm --filter @freelancer-os/api prisma:migrate:dev
 ```
 
-5) Run all services for development:
+4) Run all services for development:
 
 ```bash
 pnpm dev
